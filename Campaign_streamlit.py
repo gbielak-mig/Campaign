@@ -1,45 +1,100 @@
 import streamlit as st
 import pandas as pd
 import io
+import re
 from google.oauth2 import service_account
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
     DateRange, Dimension, Metric, RunReportRequest, FilterExpression,
-    Filter, FilterExpressionList
+    Filter, FilterExpressionList,
 )
+from google.cloud import bigquery
 from datetime import datetime, timedelta, date
 
 # ─────────────────────────────────────────────
 # KONFIGURACJA
 # ─────────────────────────────────────────────
-st.set_page_config(page_title="GA4 Exporter", layout="wide", page_icon="📊")
+st.set_page_config(page_title="GA4 + Social Exporter", layout="wide", page_icon="📊")
 
-# Stałe wymiary i metryki
-DIMENSIONS = [
-    "sessionSource",
-    "sessionMedium",
-    "sessionCampaignName",
-]
+GA4_DIMENSIONS = ["sessionSource", "sessionMedium", "sessionCampaignName"]
+GA4_METRICS    = ["sessions", "transactions", "totalRevenue", "advertiserAdCost"]
 
-METRICS = [
-    "sessions",
-    "transactions",
-    "totalRevenue",
-    "advertiserAdCost",
-]
-
-# Mapowanie platformy na wartości operatingSystemWithVersion / platform
-# GA4 używa wymiaru "platform" (WEB, IOS, ANDROID)
 PLATFORM_FILTERS = {
-    "Web":  ["WEB"],
-    "App":  ["IOS", "ANDROID"],
+    "Web": ["WEB"],
+    "App": ["IOS", "ANDROID"],
 }
+
+# ─────────────────────────────────────────────
+# MAPOWANIE MPK ← secrets
+# ─────────────────────────────────────────────
+# secrets["ga4_properties"] ma format:
+#   S501 = ["224194612", "CB",      "PLN", "50PL"]   # alias TikTok / skrót Meta w ostatnim polu
+# LUB (stary format bez aliasu) – obsługujemy oba
+#
+# Budujemy:
+#   property_mapping – DataFrame: MPK | ID_GA4 | Brand | Currency | TT_Alias | Meta_Alias
+#
+# Meta alias = pierwsza część campaign_name przed "-", np. "SYM" → mapuje na S502
+# TT  alias  = advertiser_name, np. "50PL"             → mapuje na S501
+
+def build_property_mapping():
+    rows = []
+    for mpk, vals in st.secrets["ga4_properties"].items():
+        # vals[0]=GA4 ID, vals[1]=Brand, vals[2]=Currency, vals[3]=TT/alias (opcjonalne)
+        ga4_id   = int(vals[0])
+        brand    = vals[1]
+        currency = vals[2] if len(vals) > 2 else ""
+        tt_alias = vals[3] if len(vals) > 3 else ""
+        rows.append({"MPK": mpk, "ID_GA4": ga4_id, "Brand": brand,
+                     "Currency": currency, "TT_Alias": tt_alias})
+    return pd.DataFrame(rows)
+
+property_mapping = build_property_mapping()
+
+# Słownik: TT_Alias → MPK  (np. "50PL" → "S501")
+tt_alias_to_mpk = {
+    row["TT_Alias"]: row["MPK"]
+    for _, row in property_mapping.iterrows()
+    if row["TT_Alias"]
+}
+
+# Słownik MPK → lista Meta aliasów z campaign_name
+# Zakładamy Meta alias = ostatni człon kodu przed "-" równy MPK-skrótowi
+# Mapowanie ręczne z treści zadania (Meta alias → MPK):
+META_ALIAS_TO_MPK = {
+    # z secrets: alias (kod sklepu z campaign_name) → MPK
+    "50PL": "S501",
+    "BS":   "S514",
+    "SPL":  "S500",
+    "SDE":  "G500",
+    "SCZ":  "CZ50",
+    "SSK":  "SK50",
+    "SLT":  "LT50",
+    "SRO":  "RO50",
+    "SYM":  "S502",
+    "TBL":  "S507",
+    "JDPL": "S512",
+    "JDRO": "RO55",
+    "JDSK": "SK52",
+    "JDHU": "HU52",
+    "JDLT": "LT52",
+    "JDBG": "BG52",
+    "JDCZ": "CZ55",
+    "JDUA": "UA52",
+    "JDHR": "HR52",
+}
+
+def extract_meta_alias(campaign_name: str) -> str:
+    """Wyciąga kod sklepu z nazwy kampanii Meta, np. 'SYM-ECPF-SLS-DPA-300124' → 'SYM'."""
+    if not campaign_name:
+        return ""
+    return campaign_name.split("-")[0].strip().upper()
 
 # ─────────────────────────────────────────────
 # KROK 1 – HASŁO
 # ─────────────────────────────────────────────
 if not st.session_state.get("authenticated"):
-    st.title("🔐 GA4 Exporter")
+    st.title("🔐 GA4 + Social Exporter")
     pwd = st.text_input("Hasło dostępu:", type="password")
     if st.button("Zaloguj", use_container_width=True):
         if pwd == st.secrets["app"]["password"]:
@@ -50,92 +105,36 @@ if not st.session_state.get("authenticated"):
     st.stop()
 
 # ─────────────────────────────────────────────
-# KROK 2 – GA4 CLIENT
+# KROK 2 – KLIENTY
 # ─────────────────────────────────────────────
 @st.cache_resource
-def get_client():
-    credentials = service_account.Credentials.from_service_account_info(
+def get_ga4_client():
+    creds = service_account.Credentials.from_service_account_info(
         st.secrets["gcp_service_account"],
-        scopes=["https://www.googleapis.com/auth/analytics.readonly"]
+        scopes=["https://www.googleapis.com/auth/analytics.readonly"],
     )
-    return BetaAnalyticsDataClient(credentials=credentials)
+    return BetaAnalyticsDataClient(credentials=creds)
+
+@st.cache_resource
+def get_bq_client():
+    creds = service_account.Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=["https://www.googleapis.com/auth/bigquery.readonly"],
+    )
+    return bigquery.Client(
+        credentials=creds,
+        project=st.secrets["gcp_service_account"]["project_id"],
+    )
 
 try:
-    client = get_client()
+    ga4_client = get_ga4_client()
+    bq_client  = get_bq_client()
 except Exception as e:
-    st.error(f"Błąd połączenia z Google Analytics: {e}")
+    st.error(f"Błąd połączenia: {e}")
     st.stop()
 
 # ─────────────────────────────────────────────
-# MAPOWANIE SKLEPÓW
-# ─────────────────────────────────────────────
-property_mapping = pd.DataFrame([
-    {"MPK": mpk, "ID_GA4": int(vals[0]), "Brand": vals[1]}
-    for mpk, vals in st.secrets["ga4_properties"].items()
-])
-
-# ─────────────────────────────────────────────
-# POBIERANIE DANYCH
-# ─────────────────────────────────────────────
-def build_platform_filter(platform_values: list[str]) -> FilterExpression | None:
-    """Buduje filtr GA4 dla wybranej platformy (WEB / IOS+ANDROID)."""
-    if not platform_values:
-        return None
-
-    expressions = [
-        FilterExpression(
-            filter=Filter(
-                field_name="platform",
-                string_filter=Filter.StringFilter(
-                    match_type=Filter.StringFilter.MatchType.EXACT,
-                    value=pv,
-                    case_sensitive=False,
-                ),
-            )
-        )
-        for pv in platform_values
-    ]
-
-    if len(expressions) == 1:
-        return expressions[0]
-
-    return FilterExpression(
-        or_group=FilterExpressionList(expressions=expressions)
-    )
-
-
-def get_ga4_data(property_id: int, start_date, end_date,
-                 platform_filter_expr=None) -> pd.DataFrame:
-    """Pobiera dane GA4 dla danego property i zakresu dat."""
-    try:
-        request = RunReportRequest(
-            property=f"properties/{property_id}",
-            dimensions=[Dimension(name=d) for d in DIMENSIONS],
-            metrics=[Metric(name=m) for m in METRICS],
-            date_ranges=[DateRange(start_date=str(start_date), end_date=str(end_date))],
-            dimension_filter=platform_filter_expr,
-        )
-        response = client.run_report(request)
-
-        rows = []
-        for row in response.rows:
-            rd = {DIMENSIONS[i]: v.value for i, v in enumerate(row.dimension_values)}
-            for i, mv in enumerate(row.metric_values):
-                rd[METRICS[i]] = mv.value
-            rows.append(rd)
-
-        df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=DIMENSIONS + METRICS)
-        for m in METRICS:
-            if m in df.columns:
-                df[m] = pd.to_numeric(df[m], errors="coerce").fillna(0)
-        return df
-
-    except Exception as e:
-        st.warning(f"Błąd dla ID {property_id}: {e}")
-        return pd.DataFrame(columns=DIMENSIONS + METRICS)
-
-# ─────────────────────────────────────────────
-# POMOCNICZE
+# POMOCNICZE – DATY
 # ─────────────────────────────────────────────
 yesterday = date.today() - timedelta(days=1)
 
@@ -149,15 +148,172 @@ DATE_PRESETS = {
 }
 
 # ─────────────────────────────────────────────
+# POBIERANIE – GA4
+# ─────────────────────────────────────────────
+def build_platform_filter(platform_values):
+    if not platform_values:
+        return None
+    exprs = [
+        FilterExpression(filter=Filter(
+            field_name="platform",
+            string_filter=Filter.StringFilter(
+                match_type=Filter.StringFilter.MatchType.EXACT,
+                value=pv, case_sensitive=False,
+            ),
+        ))
+        for pv in platform_values
+    ]
+    return exprs[0] if len(exprs) == 1 else FilterExpression(
+        or_group=FilterExpressionList(expressions=exprs)
+    )
+
+def get_ga4_data(property_id, start_date, end_date, platform_filter_expr=None):
+    try:
+        request = RunReportRequest(
+            property=f"properties/{property_id}",
+            dimensions=[Dimension(name=d) for d in GA4_DIMENSIONS],
+            metrics=[Metric(name=m) for m in GA4_METRICS],
+            date_ranges=[DateRange(start_date=str(start_date), end_date=str(end_date))],
+            dimension_filter=platform_filter_expr,
+        )
+        response = ga4_client.run_report(request)
+        rows = []
+        for row in response.rows:
+            rd = {GA4_DIMENSIONS[i]: v.value for i, v in enumerate(row.dimension_values)}
+            for i, mv in enumerate(row.metric_values):
+                rd[GA4_METRICS[i]] = mv.value
+            rows.append(rd)
+        df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=GA4_DIMENSIONS + GA4_METRICS)
+        for m in GA4_METRICS:
+            if m in df.columns:
+                df[m] = pd.to_numeric(df[m], errors="coerce").fillna(0)
+        return df
+    except Exception as e:
+        st.warning(f"GA4 błąd dla ID {property_id}: {e}")
+        return pd.DataFrame(columns=GA4_DIMENSIONS + GA4_METRICS)
+
+# ─────────────────────────────────────────────
+# POBIERANIE – META (BQ)
+# ─────────────────────────────────────────────
+def get_meta_data(start_date, end_date):
+    """
+    Pobiera dane z Meta AdInsights w BQ i mapuje na MPK.
+    Kolumny wynikowe: MPK, CampaignName, DateStart, AdCampaignId, Clicks, Spend, source
+    """
+    query = f"""
+        SELECT
+            CampaignName,
+            DateStart,
+            AdCampaignId,
+            Clicks,
+            Spend
+        FROM `facebook-423312.meta.AdInsights`
+        WHERE DateStart BETWEEN '{start_date}' AND '{end_date}'
+    """
+    try:
+        df = bq_client.query(query).to_dataframe()
+    except Exception as e:
+        st.warning(f"Meta BQ błąd: {e}")
+        return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    # Wyciągnij alias i zamapuj na MPK
+    df["_alias"] = df["CampaignName"].astype(str).apply(extract_meta_alias)
+    df["MPK"]    = df["_alias"].map(META_ALIAS_TO_MPK).fillna("")
+    df["source"] = "Meta"
+    df = df.drop(columns=["_alias"])
+
+    # Konwersje typów
+    df["Clicks"] = pd.to_numeric(df["Clicks"], errors="coerce").fillna(0)
+    df["Spend"]  = pd.to_numeric(df["Spend"],  errors="coerce").fillna(0)
+    df["DateStart"] = pd.to_datetime(df["DateStart"], errors="coerce").dt.date
+
+    return df
+
+# ─────────────────────────────────────────────
+# POBIERANIE – TIKTOK (BQ)
+# ─────────────────────────────────────────────
+def get_tiktok_data(start_date, end_date):
+    """
+    Pobiera dane z TikTok w BQ i mapuje na MPK przez advertiser_name.
+    Kolumny wynikowe: MPK, advertiser_name, stream_name, date, campaign_id, campaign_name, spend, source
+    """
+    query = f"""
+        SELECT
+            advertiser_name,
+            stream_name,
+            date,
+            campaign_id,
+            campaign_name,
+            spend
+        FROM `facebook-423312.tiktok_tik_tok`
+        WHERE date BETWEEN '{start_date}' AND '{end_date}'
+    """
+    try:
+        df = bq_client.query(query).to_dataframe()
+    except Exception as e:
+        st.warning(f"TikTok BQ błąd: {e}")
+        return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    # Mapowanie advertiser_name → MPK
+    # advertiser_name to alias jak "50PL", "BS" itp. – mapujemy przez TT_Alias lub META_ALIAS_TO_MPK
+    df["MPK"] = (
+        df["advertiser_name"]
+        .astype(str)
+        .str.strip()
+        .map(tt_alias_to_mpk)          # próba przez secrets TT_Alias
+        .fillna(
+            df["advertiser_name"].astype(str).str.strip().map(META_ALIAS_TO_MPK)  # fallback
+        )
+        .fillna("")
+    )
+    df["source"] = "TikTok"
+
+    df["spend"] = pd.to_numeric(df["spend"], errors="coerce").fillna(0)
+    df["date"]  = pd.to_datetime(df["date"], errors="coerce").dt.date
+
+    return df
+
+# ─────────────────────────────────────────────
 # UI – SIDEBAR
 # ─────────────────────────────────────────────
 with st.sidebar:
-    st.title("📊 GA4 Exporter")
+    st.title("📊 GA4 + Social")
     st.markdown("---")
+
+    # ── ŹRÓDŁO DANYCH ─────────────────────────
+    st.subheader("📡 Źródło danych")
+    data_source = st.radio(
+        "Wybierz źródło:",
+        ["GA4", "Meta", "TikTok", "Social (Meta + TikTok)", "Wszystko (GA4 + Social)"],
+        index=0,
+    )
+    use_ga4    = data_source in ("GA4", "Wszystko (GA4 + Social)")
+    use_meta   = data_source in ("Meta", "Social (Meta + TikTok)", "Wszystko (GA4 + Social)")
+    use_tiktok = data_source in ("TikTok", "Social (Meta + TikTok)", "Wszystko (GA4 + Social)")
+
+    st.markdown("---")
+
+    # ── PLATFORMA (tylko dla GA4) ──────────────
+    if use_ga4:
+        st.subheader("📱 Platforma GA4")
+        platform_choice = st.radio(
+            "Źródło danych GA4:",
+            ["Web", "App", "Web + App"],
+            index=2,
+        )
+        st.markdown("---")
+    else:
+        platform_choice = "Web + App"
 
     # ── WYBÓR SKLEPU ──────────────────────────
     st.subheader("🏬 Sklep")
-    brand_options = sorted(property_mapping["Brand"].unique().tolist())
+    brand_options   = sorted(property_mapping["Brand"].unique().tolist())
     selected_brands = st.multiselect("Brand (brak = wszystkie):", options=brand_options, default=[])
 
     if selected_brands:
@@ -165,23 +321,14 @@ with st.sidebar:
     else:
         filtered_map = property_mapping.copy()
 
-    mpk_options = sorted(filtered_map["MPK"].tolist())
+    mpk_options   = sorted(filtered_map["MPK"].tolist())
     selected_mpks = st.multiselect("MPK (brak = wszystkie):", options=mpk_options, default=[])
 
     if selected_mpks:
         filtered_map = filtered_map[filtered_map["MPK"].isin(selected_mpks)]
 
     st.caption(f"Wybrano {len(filtered_map)} sklep(ów)")
-    st.markdown("---")
-
-    # ── PLATFORMA ─────────────────────────────
-    st.subheader("📱 Platforma")
-    platform_choice = st.radio(
-        "Źródło danych:",
-        options=["Web", "App", "Web + App"],
-        index=2,
-        help="App = iOS + Android łącznie"
-    )
+    selected_mpk_set = set(filtered_map["MPK"].tolist())
     st.markdown("---")
 
     # ── ZAKRES DAT ────────────────────────────
@@ -204,9 +351,8 @@ with st.sidebar:
     st.subheader("🔁 Porównanie (opcjonalne)")
     compare_mode = st.selectbox(
         "Porównaj z:",
-        ["Brak", "Poprzedni okres", "Rok wcześniej", "Własny zakres"]
+        ["Brak", "Poprzedni okres", "Rok wcześniej", "Własny zakres"],
     )
-
     cmp_start = cmp_end = None
     delta = (end_date - start_date).days + 1
 
@@ -229,7 +375,7 @@ with st.sidebar:
     sheet_per_mpk       = st.checkbox("📂 Zakładka per MPK", value=False)
     sheet_per_mpk_split = st.checkbox(
         "🔀 Porównanie osobno (per MPK)", value=False,
-        disabled=(cmp_start is None)
+        disabled=(cmp_start is None),
     )
 
     run_button = st.button("🚀 URUCHOM EKSPORT", use_container_width=True, type="primary")
@@ -237,38 +383,28 @@ with st.sidebar:
 # ─────────────────────────────────────────────
 # GŁÓWNA TREŚĆ
 # ─────────────────────────────────────────────
-st.title("📊 GA4 Exporter")
+st.title("📊 GA4 + Social Exporter")
 
-# Podsumowanie wybranych parametrów
-col1, col2, col3 = st.columns(3)
-col1.metric("Sklepów", len(filtered_map))
-col2.metric("Platforma", platform_choice)
-col3.metric("Zakres", f"{start_date} → {end_date}")
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Sklepów",   len(filtered_map))
+col2.metric("Źródło",    data_source)
+col3.metric("Platforma", platform_choice if use_ga4 else "—")
+col4.metric("Zakres",    f"{start_date} → {end_date}")
 
-st.markdown("**Pobierane pola:**")
-st.caption(
-    f"Wymiary: {', '.join(DIMENSIONS)}  |  "
-    f"Metryki: {', '.join(METRICS)}"
-)
-
-# ─── Poprzedni wynik (bez ponownego uruchamiania) ───
+# Poprzedni wynik
 if not run_button:
-    if "last_combined_df" in st.session_state:
+    if "last_results" in st.session_state:
         st.info("Wyniki z poprzedniego eksportu (kliknij 🚀 aby odświeżyć):")
-        _tab_m, _tab_c = st.tabs(["📄 Dane główne", "🔁 Dane porównawcze"])
-        with _tab_m:
-            st.dataframe(st.session_state["last_combined_df"], use_container_width=True, height=400)
-        with _tab_c:
-            cmp_df = st.session_state.get("last_combined_cmp", pd.DataFrame())
-            if not cmp_df.empty:
-                st.dataframe(cmp_df, use_container_width=True, height=400)
-            else:
-                st.info("Brak danych porównawczych.")
-        if "last_excel_bytes" in st.session_state:
+        last = st.session_state["last_results"]
+        tabs = st.tabs([k for k in last["dfs"].keys()])
+        for tab, (name, df) in zip(tabs, last["dfs"].items()):
+            with tab:
+                st.dataframe(df, use_container_width=True, height=400)
+        if "excel_bytes" in last:
             st.download_button(
-                label="📥 Pobierz Excel (poprzedni eksport)",
-                data=st.session_state["last_excel_bytes"],
-                file_name=st.session_state.get("last_file_name", "GA4_Export.xlsx"),
+                "📥 Pobierz Excel (poprzedni eksport)",
+                data=last["excel_bytes"],
+                file_name=last["file_name"],
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
@@ -277,136 +413,258 @@ if not run_button:
     st.stop()
 
 # ─────────────────────────────────────────────
-# EKSPORT
+# WALIDACJA
 # ─────────────────────────────────────────────
 if start_date > end_date:
     st.error("Błędny zakres dat!")
     st.stop()
-
 if filtered_map.empty:
     st.error("Nie wybrano żadnych sklepów!")
     st.stop()
 
-# Ustal filtry platformy
-if platform_choice == "Web + App":
-    platform_expr = None  # brak filtra = wszystkie platformy
-elif platform_choice == "Web":
-    platform_expr = build_platform_filter(PLATFORM_FILTERS["Web"])
-else:  # App
-    platform_expr = build_platform_filter(PLATFORM_FILTERS["App"])
+# ─────────────────────────────────────────────
+# EKSPORT – GA4
+# ─────────────────────────────────────────────
+combined_ga4      = pd.DataFrame()
+combined_ga4_cmp  = pd.DataFrame()
+ga4_per_mpk       = {}
+ga4_per_mpk_cmp   = {}
 
-all_results     = {}
-all_results_cmp = {}
-combined_df     = pd.DataFrame()
-combined_cmp    = pd.DataFrame()
+if use_ga4:
+    if platform_choice == "Web + App":
+        platform_expr = None
+    elif platform_choice == "Web":
+        platform_expr = build_platform_filter(PLATFORM_FILTERS["Web"])
+    else:
+        platform_expr = build_platform_filter(PLATFORM_FILTERS["App"])
 
-progress_bar = st.progress(0)
-status_text  = st.empty()
+    progress_bar = st.progress(0)
+    status_text  = st.empty()
 
-for i, (_, row) in enumerate(filtered_map.iterrows()):
-    status_text.write(f"⏳ Pobieranie: **{row['MPK']}** ({row['Brand']})...")
+    for i, (_, row) in enumerate(filtered_map.iterrows()):
+        status_text.write(f"⏳ GA4 – **{row['MPK']}** ({row['Brand']})…")
 
-    df_main = get_ga4_data(row["ID_GA4"], start_date, end_date, platform_expr)
-    df_cmp  = (
-        get_ga4_data(row["ID_GA4"], cmp_start, cmp_end, platform_expr)
-        if cmp_start and cmp_end else None
-    )
+        df_main = get_ga4_data(row["ID_GA4"], start_date, end_date, platform_expr)
+        df_cmp  = (
+            get_ga4_data(row["ID_GA4"], cmp_start, cmp_end, platform_expr)
+            if cmp_start and cmp_end else None
+        )
 
-    def enrich(df, label):
-        if df is not None and not df.empty:
-            df = df.copy()
-            df["MPK"]        = row["MPK"]
-            df["Brand"]      = row["Brand"]
-            df["Platforma"]  = platform_choice
-            df["date_range"] = label
-        return df
+        def enrich_ga4(df, label):
+            if df is not None and not df.empty:
+                df = df.copy()
+                df["MPK"]        = row["MPK"]
+                df["Brand"]      = row["Brand"]
+                df["Platforma"]  = platform_choice
+                df["date_range"] = label
+            return df
 
-    date_label     = f"{start_date.strftime('%d%m%Y')}_{end_date.strftime('%d%m%Y')}"
-    date_label_cmp = (
-        f"{cmp_start.strftime('%d%m%Y')}_{cmp_end.strftime('%d%m%Y')}"
-        if cmp_start else None
-    )
+        lbl     = f"{start_date.strftime('%d%m%Y')}_{end_date.strftime('%d%m%Y')}"
+        lbl_cmp = (f"{cmp_start.strftime('%d%m%Y')}_{cmp_end.strftime('%d%m%Y')}"
+                   if cmp_start else None)
 
-    df_main = enrich(df_main, date_label)
-    df_cmp  = enrich(df_cmp,  date_label_cmp)
+        df_main = enrich_ga4(df_main, lbl)
+        df_cmp  = enrich_ga4(df_cmp,  lbl_cmp)
 
-    if df_main is not None and not df_main.empty:
-        all_results[row["MPK"]] = df_main
-        combined_df = pd.concat([combined_df, df_main], ignore_index=True)
+        if df_main is not None and not df_main.empty:
+            ga4_per_mpk[row["MPK"]] = df_main
+            combined_ga4 = pd.concat([combined_ga4, df_main], ignore_index=True)
 
-    if df_cmp is not None and not df_cmp.empty:
-        all_results_cmp[row["MPK"]] = df_cmp
-        combined_cmp = pd.concat([combined_cmp, df_cmp], ignore_index=True)
+        if df_cmp is not None and not df_cmp.empty:
+            ga4_per_mpk_cmp[row["MPK"]] = df_cmp
+            combined_ga4_cmp = pd.concat([combined_ga4_cmp, df_cmp], ignore_index=True)
 
-    progress_bar.progress((i + 1) / len(filtered_map))
+        progress_bar.progress((i + 1) / len(filtered_map))
 
-status_text.empty()
-progress_bar.empty()
+    status_text.empty()
+    progress_bar.empty()
+
+# ─────────────────────────────────────────────
+# EKSPORT – META
+# ─────────────────────────────────────────────
+combined_meta     = pd.DataFrame()
+combined_meta_cmp = pd.DataFrame()
+
+if use_meta:
+    with st.spinner("⏳ Pobieranie danych Meta…"):
+        df_meta = get_meta_data(start_date, end_date)
+        if not df_meta.empty and selected_mpk_set:
+            df_meta = df_meta[df_meta["MPK"].isin(selected_mpk_set)]
+        combined_meta = df_meta
+
+        if cmp_start and cmp_end:
+            df_meta_cmp = get_meta_data(cmp_start, cmp_end)
+            if not df_meta_cmp.empty and selected_mpk_set:
+                df_meta_cmp = df_meta_cmp[df_meta_cmp["MPK"].isin(selected_mpk_set)]
+            combined_meta_cmp = df_meta_cmp
+
+# ─────────────────────────────────────────────
+# EKSPORT – TIKTOK
+# ─────────────────────────────────────────────
+combined_tiktok     = pd.DataFrame()
+combined_tiktok_cmp = pd.DataFrame()
+
+if use_tiktok:
+    with st.spinner("⏳ Pobieranie danych TikTok…"):
+        df_tt = get_tiktok_data(start_date, end_date)
+        if not df_tt.empty and selected_mpk_set:
+            df_tt = df_tt[df_tt["MPK"].isin(selected_mpk_set)]
+        combined_tiktok = df_tt
+
+        if cmp_start and cmp_end:
+            df_tt_cmp = get_tiktok_data(cmp_start, cmp_end)
+            if not df_tt_cmp.empty and selected_mpk_set:
+                df_tt_cmp = df_tt_cmp[df_tt_cmp["MPK"].isin(selected_mpk_set)]
+            combined_tiktok_cmp = df_tt_cmp
+
+# ─────────────────────────────────────────────
+# SOCIAL COMBINED (Meta + TikTok) per MPK
+# ─────────────────────────────────────────────
+def social_summary(meta_df, tiktok_df):
+    """Sumuje Spend per MPK z Meta i TikTok."""
+    frames = []
+    if not meta_df.empty:
+        m = meta_df[["MPK", "Spend"]].copy().rename(columns={"Spend": "Spend_Meta"})
+        m = m.groupby("MPK", as_index=False)["Spend_Meta"].sum()
+        frames.append(m.set_index("MPK"))
+    if not tiktok_df.empty:
+        t = tiktok_df[["MPK", "spend"]].copy().rename(columns={"spend": "Spend_TikTok"})
+        t = t.groupby("MPK", as_index=False)["Spend_TikTok"].sum()
+        frames.append(t.set_index("MPK"))
+    if not frames:
+        return pd.DataFrame()
+    result = pd.concat(frames, axis=1).fillna(0).reset_index()
+    result["Spend_Total_Social"] = result.get("Spend_Meta", 0) + result.get("Spend_TikTok", 0)
+    return result
+
+social_summary_df     = social_summary(combined_meta, combined_tiktok)
+social_summary_cmp_df = social_summary(combined_meta_cmp, combined_tiktok_cmp)
 
 # ─────────────────────────────────────────────
 # PODGLĄD
 # ─────────────────────────────────────────────
-st.success(f"✅ Pobrano dane dla {len(all_results)} sklepów.")
+st.success("✅ Dane pobrane!")
 
-tab_main, tab_cmp = st.tabs(["📄 Dane główne", "🔁 Dane porównawcze"])
-with tab_main:
-    st.dataframe(combined_df, use_container_width=True, height=400)
-    st.caption(f"Łącznie wierszy: {len(combined_df):,}")
-with tab_cmp:
-    if not combined_cmp.empty:
-        st.dataframe(combined_cmp, use_container_width=True, height=400)
-        st.caption(f"Łącznie wierszy (porównanie): {len(combined_cmp):,}")
-    else:
-        st.info("Brak danych porównawczych.")
+tab_labels = []
+tab_data   = {}
 
-st.session_state["last_combined_df"]  = combined_df
-st.session_state["last_combined_cmp"] = combined_cmp
+if use_ga4:
+    tab_labels += ["📄 GA4 – Główny", "🔁 GA4 – Porównanie"]
+    tab_data["📄 GA4 – Główny"]      = combined_ga4
+    tab_data["🔁 GA4 – Porównanie"]  = combined_ga4_cmp
+
+if use_meta:
+    tab_labels += ["📘 Meta – Główny", "🔁 Meta – Porównanie"]
+    tab_data["📘 Meta – Główny"]     = combined_meta
+    tab_data["🔁 Meta – Porównanie"] = combined_meta_cmp
+
+if use_tiktok:
+    tab_labels += ["🎵 TikTok – Główny", "🔁 TikTok – Porównanie"]
+    tab_data["🎵 TikTok – Główny"]      = combined_tiktok
+    tab_data["🔁 TikTok – Porównanie"]  = combined_tiktok_cmp
+
+if use_meta or use_tiktok:
+    tab_labels += ["💰 Social Summary"]
+    tab_data["💰 Social Summary"] = social_summary_df
+
+tabs = st.tabs(tab_labels)
+for tab, name in zip(tabs, tab_labels):
+    with tab:
+        df_show = tab_data[name]
+        if df_show is not None and not df_show.empty:
+            st.dataframe(df_show, use_container_width=True, height=400)
+            st.caption(f"Wierszy: {len(df_show):,}")
+        else:
+            st.info("Brak danych.")
 
 # ─────────────────────────────────────────────
 # EXCEL
 # ─────────────────────────────────────────────
-file_name = f"GA4_Export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+file_name = f"GA4_Social_Export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 output    = io.BytesIO()
 
 with pd.ExcelWriter(output, engine="openpyxl") as writer:
     sheets_written = 0
 
-    # Domyślnie: Combined_All
-    merged_all = pd.concat([combined_df, combined_cmp], ignore_index=True)
-    if not merged_all.empty:
-        merged_all.to_excel(writer, sheet_name="Combined_All", index=False)
-        sheets_written += 1
+    def safe_write(df, sheet_name):
+        nonlocal sheets_written
+        if df is not None and not df.empty:
+            name = sheet_name[:31]
+            df.to_excel(writer, sheet_name=name, index=False)
+            sheets_written += 1
 
-    # Per MPK (razem)
+    # ── Zakładki główne ───────────────────────
+    if use_ga4:
+        merged_ga4 = pd.concat([combined_ga4, combined_ga4_cmp], ignore_index=True)
+        safe_write(merged_ga4,          "GA4_Combined")
+        safe_write(combined_ga4,        "GA4_Main")
+        if not combined_ga4_cmp.empty:
+            safe_write(combined_ga4_cmp, "GA4_Compare")
+
+    if use_meta:
+        safe_write(combined_meta,        "Meta_Main")
+        if not combined_meta_cmp.empty:
+            safe_write(combined_meta_cmp, "Meta_Compare")
+
+    if use_tiktok:
+        safe_write(combined_tiktok,      "TikTok_Main")
+        if not combined_tiktok_cmp.empty:
+            safe_write(combined_tiktok_cmp, "TikTok_Compare")
+
+    if use_meta or use_tiktok:
+        safe_write(social_summary_df,    "Social_Summary")
+        if not social_summary_cmp_df.empty:
+            safe_write(social_summary_cmp_df, "Social_Summary_Cmp")
+
+    # ── Per MPK ───────────────────────────────
     if sheet_per_mpk:
-        all_mpks = sorted(set(list(all_results) + list(all_results_cmp)))
+        all_mpks = sorted(selected_mpk_set or set(property_mapping["MPK"]))
         for mpk in all_mpks:
             frames = []
-            if mpk in all_results:     frames.append(all_results[mpk])
-            if mpk in all_results_cmp: frames.append(all_results_cmp[mpk])
+            if use_ga4:
+                if mpk in ga4_per_mpk:     frames.append(ga4_per_mpk[mpk].assign(source="GA4_main"))
+                if mpk in ga4_per_mpk_cmp: frames.append(ga4_per_mpk_cmp[mpk].assign(source="GA4_cmp"))
+            if use_meta and not combined_meta.empty:
+                sub = combined_meta[combined_meta["MPK"] == mpk]
+                if not sub.empty: frames.append(sub)
+            if use_tiktok and not combined_tiktok.empty:
+                sub = combined_tiktok[combined_tiktok["MPK"] == mpk]
+                if not sub.empty: frames.append(sub)
             if frames:
-                pd.concat(frames, ignore_index=True).to_excel(
-                    writer, sheet_name=str(mpk)[:31], index=False
-                )
-                sheets_written += 1
+                safe_write(pd.concat(frames, ignore_index=True), str(mpk))
 
-    # Per MPK – porównanie osobno
+    # ── Per MPK – porównanie osobno ───────────
     if sheet_per_mpk_split and cmp_start:
-        all_mpks = sorted(set(list(all_results) + list(all_results_cmp)))
+        all_mpks = sorted(selected_mpk_set or set(property_mapping["MPK"]))
         for mpk in all_mpks:
-            if mpk in all_results:
-                all_results[mpk].to_excel(writer, sheet_name=f"{mpk}_main"[:31], index=False)
-                sheets_written += 1
-            if mpk in all_results_cmp:
-                all_results_cmp[mpk].to_excel(writer, sheet_name=f"{mpk}_cmp"[:31], index=False)
-                sheets_written += 1
+            if use_ga4 and mpk in ga4_per_mpk:
+                safe_write(ga4_per_mpk[mpk],     f"{mpk}_GA4_m")
+            if use_ga4 and mpk in ga4_per_mpk_cmp:
+                safe_write(ga4_per_mpk_cmp[mpk], f"{mpk}_GA4_c")
+            if use_meta and not combined_meta.empty:
+                sub = combined_meta[combined_meta["MPK"] == mpk]
+                if not sub.empty: safe_write(sub, f"{mpk}_Meta_m")
+            if use_meta and not combined_meta_cmp.empty:
+                sub = combined_meta_cmp[combined_meta_cmp["MPK"] == mpk]
+                if not sub.empty: safe_write(sub, f"{mpk}_Meta_c")
+            if use_tiktok and not combined_tiktok.empty:
+                sub = combined_tiktok[combined_tiktok["MPK"] == mpk]
+                if not sub.empty: safe_write(sub, f"{mpk}_TT_m")
+            if use_tiktok and not combined_tiktok_cmp.empty:
+                sub = combined_tiktok_cmp[combined_tiktok_cmp["MPK"] == mpk]
+                if not sub.empty: safe_write(sub, f"{mpk}_TT_c")
 
     if sheets_written == 0:
         pd.DataFrame().to_excel(writer, sheet_name="Empty", index=False)
 
 excel_bytes = output.getvalue()
-st.session_state["last_excel_bytes"] = excel_bytes
-st.session_state["last_file_name"]   = file_name
+
+# Zapisz do session_state
+st.session_state["last_results"] = {
+    "dfs":        tab_data,
+    "excel_bytes": excel_bytes,
+    "file_name":   file_name,
+}
 
 st.download_button(
     label="📥 Pobierz plik Excel",
