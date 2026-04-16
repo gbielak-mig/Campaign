@@ -27,20 +27,9 @@ PLATFORM_FILTERS = {
 # ─────────────────────────────────────────────
 # MAPOWANIE MPK ← secrets
 # ─────────────────────────────────────────────
-# secrets["ga4_properties"] ma format:
-#   S501 = ["224194612", "CB",      "PLN", "50PL"]   # alias TikTok / skrót Meta w ostatnim polu
-# LUB (stary format bez aliasu) – obsługujemy oba
-#
-# Budujemy:
-#   property_mapping – DataFrame: MPK | ID_GA4 | Brand | Currency | TT_Alias | Meta_Alias
-#
-# Meta alias = pierwsza część campaign_name przed "-", np. "SYM" → mapuje na S502
-# TT  alias  = advertiser_name, np. "50PL"             → mapuje na S501
-
 def build_property_mapping():
     rows = []
     for mpk, vals in st.secrets["ga4_properties"].items():
-        # vals[0]=GA4 ID, vals[1]=Brand, vals[2]=Currency, vals[3]=TT/alias (opcjonalne)
         ga4_id   = int(vals[0])
         brand    = vals[1]
         currency = vals[2] if len(vals) > 2 else ""
@@ -51,18 +40,13 @@ def build_property_mapping():
 
 property_mapping = build_property_mapping()
 
-# Słownik: TT_Alias → MPK  (np. "50PL" → "S501")
 tt_alias_to_mpk = {
     row["TT_Alias"]: row["MPK"]
     for _, row in property_mapping.iterrows()
     if row["TT_Alias"]
 }
 
-# Słownik MPK → lista Meta aliasów z campaign_name
-# Zakładamy Meta alias = ostatni człon kodu przed "-" równy MPK-skrótowi
-# Mapowanie ręczne z treści zadania (Meta alias → MPK):
 META_ALIAS_TO_MPK = {
-    # z secrets: alias (kod sklepu z campaign_name) → MPK
     "50PL": "S501",
     "BS":   "S514",
     "SPL":  "S500",
@@ -85,7 +69,6 @@ META_ALIAS_TO_MPK = {
 }
 
 def extract_meta_alias(campaign_name: str) -> str:
-    """Wyciąga kod sklepu z nazwy kampanii Meta, np. 'SYM-ECPF-SLS-DPA-300124' → 'SYM'."""
     if not campaign_name:
         return ""
     return campaign_name.split("-")[0].strip().upper()
@@ -196,10 +179,6 @@ def get_ga4_data(property_id, start_date, end_date, platform_filter_expr=None):
 # POBIERANIE – META (BQ)
 # ─────────────────────────────────────────────
 def get_meta_data(start_date, end_date):
-    """
-    Pobiera dane z Meta AdInsights w BQ i mapuje na MPK.
-    Kolumny wynikowe: MPK, CampaignName, DateStart, AdCampaignId, Clicks, Spend, source
-    """
     query = f"""
         SELECT
             CampaignName,
@@ -219,13 +198,11 @@ def get_meta_data(start_date, end_date):
     if df.empty:
         return df
 
-    # Wyciągnij alias i zamapuj na MPK
     df["_alias"] = df["CampaignName"].astype(str).apply(extract_meta_alias)
     df["MPK"]    = df["_alias"].map(META_ALIAS_TO_MPK).fillna("")
     df["source"] = "Meta"
     df = df.drop(columns=["_alias"])
 
-    # Konwersje typów
     df["Clicks"] = pd.to_numeric(df["Clicks"], errors="coerce").fillna(0)
     df["Spend"]  = pd.to_numeric(df["Spend"],  errors="coerce").fillna(0)
     df["DateStart"] = pd.to_datetime(df["DateStart"], errors="coerce").dt.date
@@ -236,10 +213,6 @@ def get_meta_data(start_date, end_date):
 # POBIERANIE – TIKTOK (BQ)
 # ─────────────────────────────────────────────
 def get_tiktok_data(start_date, end_date):
-    """
-    Pobiera dane z TikTok w BQ i mapuje na MPK przez advertiser_name.
-    Kolumny wynikowe: MPK, advertiser_name, stream_name, date, campaign_id, campaign_name, spend, source
-    """
     query = f"""
         SELECT
             advertiser_name,
@@ -260,15 +233,13 @@ def get_tiktok_data(start_date, end_date):
     if df.empty:
         return df
 
-    # Mapowanie advertiser_name → MPK
-    # advertiser_name to alias jak "50PL", "BS" itp. – mapujemy przez TT_Alias lub META_ALIAS_TO_MPK
     df["MPK"] = (
         df["advertiser_name"]
         .astype(str)
         .str.strip()
-        .map(tt_alias_to_mpk)          # próba przez secrets TT_Alias
+        .map(tt_alias_to_mpk)
         .fillna(
-            df["advertiser_name"].astype(str).str.strip().map(META_ALIAS_TO_MPK)  # fallback
+            df["advertiser_name"].astype(str).str.strip().map(META_ALIAS_TO_MPK)
         )
         .fillna("")
     )
@@ -286,7 +257,6 @@ with st.sidebar:
     st.title("📊 GA4 + Social")
     st.markdown("---")
 
-    # ── ŹRÓDŁO DANYCH ─────────────────────────
     st.subheader("📡 Źródło danych")
     data_source = st.radio(
         "Wybierz źródło:",
@@ -299,7 +269,6 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ── PLATFORMA (tylko dla GA4) ──────────────
     if use_ga4:
         st.subheader("📱 Platforma GA4")
         platform_choice = st.radio(
@@ -311,7 +280,6 @@ with st.sidebar:
     else:
         platform_choice = "Web + App"
 
-    # ── WYBÓR SKLEPU ──────────────────────────
     st.subheader("🏬 Sklep")
     brand_options   = sorted(property_mapping["Brand"].unique().tolist())
     selected_brands = st.multiselect("Brand (brak = wszystkie):", options=brand_options, default=[])
@@ -331,7 +299,6 @@ with st.sidebar:
     selected_mpk_set = set(filtered_map["MPK"].tolist())
     st.markdown("---")
 
-    # ── ZAKRES DAT ────────────────────────────
     st.subheader("📅 Zakres dat")
     preset_label = st.selectbox("Zakres:", options=list(DATE_PRESETS.keys()), index=0)
     preset_days  = DATE_PRESETS[preset_label]
@@ -346,7 +313,6 @@ with st.sidebar:
         if start_date > end_date:
             st.error("Data 'Od' musi być wcześniej niż 'Do'!")
 
-    # ── PORÓWNANIE ────────────────────────────
     st.markdown("---")
     st.subheader("🔁 Porównanie (opcjonalne)")
     compare_mode = st.selectbox(
@@ -370,7 +336,6 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ── OPCJE EXCEL ───────────────────────────
     st.subheader("💾 Arkusze Excel")
     sheet_per_mpk       = st.checkbox("📂 Zakładka per MPK", value=False)
     sheet_per_mpk_split = st.checkbox(
@@ -391,7 +356,6 @@ col2.metric("Źródło",    data_source)
 col3.metric("Platforma", platform_choice if use_ga4 else "—")
 col4.metric("Zakres",    f"{start_date} → {end_date}")
 
-# Poprzedni wynik
 if not run_button:
     if "last_results" in st.session_state:
         st.info("Wyniki z poprzedniego eksportu (kliknij 🚀 aby odświeżyć):")
@@ -521,7 +485,6 @@ if use_tiktok:
 # SOCIAL COMBINED (Meta + TikTok) per MPK
 # ─────────────────────────────────────────────
 def social_summary(meta_df, tiktok_df):
-    """Sumuje Spend per MPK z Meta i TikTok."""
     frames = []
     if not meta_df.empty:
         m = meta_df[["MPK", "Spend"]].copy().rename(columns={"Spend": "Spend_Meta"})
@@ -580,41 +543,41 @@ for tab, name in zip(tabs, tab_labels):
 # ─────────────────────────────────────────────
 # EXCEL
 # ─────────────────────────────────────────────
-file_name = f"GA4_Social_Export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-output    = io.BytesIO()
+file_name      = f"GA4_Social_Export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+output         = io.BytesIO()
+sheets_written = 0  # FIX: przeniesione przed blok `with`
+
+def safe_write(df, sheet_name, writer):  # FIX: writer przekazywany jako argument
+    global sheets_written
+    if df is not None and not df.empty:
+        name = sheet_name[:31]
+        df.to_excel(writer, sheet_name=name, index=False)
+        sheets_written += 1
 
 with pd.ExcelWriter(output, engine="openpyxl") as writer:
-    sheets_written = 0
-
-    def safe_write(df, sheet_name):
-        nonlocal sheets_written
-        if df is not None and not df.empty:
-            name = sheet_name[:31]
-            df.to_excel(writer, sheet_name=name, index=False)
-            sheets_written += 1
 
     # ── Zakładki główne ───────────────────────
     if use_ga4:
         merged_ga4 = pd.concat([combined_ga4, combined_ga4_cmp], ignore_index=True)
-        safe_write(merged_ga4,          "GA4_Combined")
-        safe_write(combined_ga4,        "GA4_Main")
+        safe_write(merged_ga4,           "GA4_Combined", writer)
+        safe_write(combined_ga4,         "GA4_Main",     writer)
         if not combined_ga4_cmp.empty:
-            safe_write(combined_ga4_cmp, "GA4_Compare")
+            safe_write(combined_ga4_cmp, "GA4_Compare",  writer)
 
     if use_meta:
-        safe_write(combined_meta,        "Meta_Main")
+        safe_write(combined_meta,        "Meta_Main",    writer)
         if not combined_meta_cmp.empty:
-            safe_write(combined_meta_cmp, "Meta_Compare")
+            safe_write(combined_meta_cmp, "Meta_Compare", writer)
 
     if use_tiktok:
-        safe_write(combined_tiktok,      "TikTok_Main")
+        safe_write(combined_tiktok,      "TikTok_Main",  writer)
         if not combined_tiktok_cmp.empty:
-            safe_write(combined_tiktok_cmp, "TikTok_Compare")
+            safe_write(combined_tiktok_cmp, "TikTok_Compare", writer)
 
     if use_meta or use_tiktok:
-        safe_write(social_summary_df,    "Social_Summary")
+        safe_write(social_summary_df,    "Social_Summary", writer)
         if not social_summary_cmp_df.empty:
-            safe_write(social_summary_cmp_df, "Social_Summary_Cmp")
+            safe_write(social_summary_cmp_df, "Social_Summary_Cmp", writer)
 
     # ── Per MPK ───────────────────────────────
     if sheet_per_mpk:
@@ -631,28 +594,28 @@ with pd.ExcelWriter(output, engine="openpyxl") as writer:
                 sub = combined_tiktok[combined_tiktok["MPK"] == mpk]
                 if not sub.empty: frames.append(sub)
             if frames:
-                safe_write(pd.concat(frames, ignore_index=True), str(mpk))
+                safe_write(pd.concat(frames, ignore_index=True), str(mpk), writer)
 
     # ── Per MPK – porównanie osobno ───────────
     if sheet_per_mpk_split and cmp_start:
         all_mpks = sorted(selected_mpk_set or set(property_mapping["MPK"]))
         for mpk in all_mpks:
             if use_ga4 and mpk in ga4_per_mpk:
-                safe_write(ga4_per_mpk[mpk],     f"{mpk}_GA4_m")
+                safe_write(ga4_per_mpk[mpk],     f"{mpk}_GA4_m", writer)
             if use_ga4 and mpk in ga4_per_mpk_cmp:
-                safe_write(ga4_per_mpk_cmp[mpk], f"{mpk}_GA4_c")
+                safe_write(ga4_per_mpk_cmp[mpk], f"{mpk}_GA4_c", writer)
             if use_meta and not combined_meta.empty:
                 sub = combined_meta[combined_meta["MPK"] == mpk]
-                if not sub.empty: safe_write(sub, f"{mpk}_Meta_m")
+                if not sub.empty: safe_write(sub, f"{mpk}_Meta_m", writer)
             if use_meta and not combined_meta_cmp.empty:
                 sub = combined_meta_cmp[combined_meta_cmp["MPK"] == mpk]
-                if not sub.empty: safe_write(sub, f"{mpk}_Meta_c")
+                if not sub.empty: safe_write(sub, f"{mpk}_Meta_c", writer)
             if use_tiktok and not combined_tiktok.empty:
                 sub = combined_tiktok[combined_tiktok["MPK"] == mpk]
-                if not sub.empty: safe_write(sub, f"{mpk}_TT_m")
+                if not sub.empty: safe_write(sub, f"{mpk}_TT_m", writer)
             if use_tiktok and not combined_tiktok_cmp.empty:
                 sub = combined_tiktok_cmp[combined_tiktok_cmp["MPK"] == mpk]
-                if not sub.empty: safe_write(sub, f"{mpk}_TT_c")
+                if not sub.empty: safe_write(sub, f"{mpk}_TT_c", writer)
 
     if sheets_written == 0:
         pd.DataFrame().to_excel(writer, sheet_name="Empty", index=False)
@@ -661,7 +624,7 @@ excel_bytes = output.getvalue()
 
 # Zapisz do session_state
 st.session_state["last_results"] = {
-    "dfs":        tab_data,
+    "dfs":         tab_data,
     "excel_bytes": excel_bytes,
     "file_name":   file_name,
 }
