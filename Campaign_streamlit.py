@@ -242,7 +242,7 @@ def get_ga4_data(property_id, start_date, end_date, platform_filter_expr=None):
 # ─────────────────────────────────────────────
 def get_meta_data(start_date, end_date):
     query = f"""
-        SELECT CampaignName, DateStart, AdCampaignId, Clicks, Spend
+        SELECT CampaignName, CampaignId, DateStart, Clicks, Spend
         FROM `facebook-423312.meta.AdInsights`
         WHERE DateStart BETWEEN '{start_date}' AND '{end_date}'
     """
