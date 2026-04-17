@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import re
 from google.oauth2 import service_account
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
@@ -8,10 +7,10 @@ from google.analytics.data_v1beta.types import (
     Filter, FilterExpressionList,
 )
 from google.cloud import bigquery
-from datetime import datetime, timedelta, date
+from datetime import timedelta, date
 
 # ─────────────────────────────────────────────
-# KONFIGURACJA
+# CONFIG
 # ─────────────────────────────────────────────
 st.set_page_config(page_title="GA4 + Social Dashboard", layout="wide", page_icon="📊")
 
@@ -19,95 +18,64 @@ GA4_DIMENSIONS = ["sessionSource", "sessionMedium", "sessionCampaignName"]
 GA4_METRICS    = ["sessions", "transactions", "totalRevenue", "advertiserAdCost"]
 
 PLATFORM_FILTERS = {
-    "Web": ["WEB"],
-    "App": ["IOS", "ANDROID"],
+    "Web":  ["WEB"],
+    "App":  ["IOS", "ANDROID"],
 }
 
-# ─────────────────────────────────────────────
-# STYLE
-# ─────────────────────────────────────────────
 st.markdown("""
 <style>
-.metric-card {
-    background: var(--color-background-secondary);
-    border-radius: 8px;
-    padding: 14px 16px;
-    margin-bottom: 8px;
-}
-.metric-label {
-    font-size: 12px;
-    color: var(--color-text-secondary);
-    margin-bottom: 4px;
-}
-.metric-value {
-    font-size: 22px;
-    font-weight: 500;
-    color: var(--color-text-primary);
-}
-.metric-compare {
-    font-size: 12px;
-    margin-top: 2px;
-}
-.compare-pos { color: var(--color-text-success); }
-.compare-neg { color: var(--color-text-danger); }
-.compare-neu { color: var(--color-text-secondary); }
-.section-header {
-    font-size: 16px;
-    font-weight: 500;
-    color: var(--color-text-primary);
-    margin: 24px 0 12px;
-    padding-bottom: 6px;
-    border-bottom: 0.5px solid var(--color-border-tertiary);
-}
-div[data-testid="stDataFrame"] {
-    border: 0.5px solid var(--color-border-tertiary);
-    border-radius: 8px;
-    overflow: hidden;
-}
+.kpi-card{background:var(--color-background-secondary);border-radius:8px;padding:14px 16px;margin-bottom:8px}
+.kpi-label{font-size:12px;color:var(--color-text-secondary);margin-bottom:4px}
+.kpi-value{font-size:22px;font-weight:500;color:var(--color-text-primary)}
+.kpi-cmp{font-size:12px;margin-top:2px}
+.pos{color:var(--color-text-success)}
+.neg{color:var(--color-text-danger)}
+.neu{color:var(--color-text-secondary)}
+.sec{font-size:15px;font-weight:500;color:var(--color-text-primary);
+     margin:20px 0 10px;padding-bottom:5px;
+     border-bottom:0.5px solid var(--color-border-tertiary)}
 </style>
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# MAPOWANIE MPK
+# MAPPINGS
 # ─────────────────────────────────────────────
 def build_property_mapping():
     rows = []
     for mpk, vals in st.secrets["ga4_properties"].items():
-        ga4_id   = int(vals[0])
-        brand    = vals[1]
-        currency = vals[2] if len(vals) > 2 else ""
-        tt_alias = vals[3] if len(vals) > 3 else ""
-        rows.append({"MPK": mpk, "ID_GA4": ga4_id, "Brand": brand,
-                     "Currency": currency, "TT_Alias": tt_alias})
+        rows.append({
+            "MPK":      mpk,
+            "ID_GA4":   int(vals[0]),
+            "Brand":    vals[1],
+            "Currency": vals[2] if len(vals) > 2 else "",
+            "TT_Alias": vals[3] if len(vals) > 3 else "",
+        })
     return pd.DataFrame(rows)
 
 property_mapping = build_property_mapping()
 
 tt_alias_to_mpk = {
-    row["TT_Alias"]: row["MPK"]
-    for _, row in property_mapping.iterrows()
-    if row["TT_Alias"]
+    r["TT_Alias"]: r["MPK"]
+    for _, r in property_mapping.iterrows() if r["TT_Alias"]
 }
 
 META_ALIAS_TO_MPK = {
-    "50PL": "S501", "BS": "S514", "SPL": "S500", "SDE": "G500",
-    "SCZ": "CZ50", "SSK": "SK50", "SLT": "LT50", "SRO": "RO50",
-    "SYM": "S502", "TBL": "S507", "JDPL": "S512", "JDRO": "RO55",
-    "JDSK": "SK52", "JDHU": "HU52", "JDLT": "LT52", "JDBG": "BG52",
-    "JDCZ": "CZ55", "JDUA": "UA52", "JDHR": "HR52",
+    "50PL":"S501","BS":"S514","SPL":"S500","SDE":"G500",
+    "SCZ":"CZ50","SSK":"SK50","SLT":"LT50","SRO":"RO50",
+    "SYM":"S502","TBL":"S507","JDPL":"S512","JDRO":"RO55",
+    "JDSK":"SK52","JDHU":"HU52","JDLT":"LT52","JDBG":"BG52",
+    "JDCZ":"CZ55","JDUA":"UA52","JDHR":"HR52",
 }
 
-def extract_meta_alias(campaign_name: str) -> str:
-    if not campaign_name:
-        return ""
-    return campaign_name.split("-")[0].strip().upper()
+def extract_meta_alias(name: str) -> str:
+    return name.split("-")[0].strip().upper() if name else ""
 
 # ─────────────────────────────────────────────
-# KROK 1 – HASŁO
+# AUTH
 # ─────────────────────────────────────────────
 if not st.session_state.get("authenticated"):
     st.title("🔐 GA4 + Social Dashboard")
-    pwd = st.text_input("Hasło dostępu:", type="password")
+    pwd = st.text_input("Hasło:", type="password")
     if st.button("Zaloguj", use_container_width=True):
         if pwd == st.secrets["app"]["password"]:
             st.session_state["authenticated"] = True
@@ -117,7 +85,7 @@ if not st.session_state.get("authenticated"):
     st.stop()
 
 # ─────────────────────────────────────────────
-# KLIENTY
+# CLIENTS
 # ─────────────────────────────────────────────
 @st.cache_resource
 def get_ga4_client():
@@ -150,7 +118,7 @@ except Exception as e:
     st.stop()
 
 # ─────────────────────────────────────────────
-# POMOCNICZE
+# HELPERS
 # ─────────────────────────────────────────────
 yesterday = date.today() - timedelta(days=1)
 
@@ -163,67 +131,59 @@ DATE_PRESETS = {
     "Własny zakres":   None,
 }
 
-def fmt_num(val, is_currency=False, currency=""):
+def fmt(val, dec=0):
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return "—"
-    if is_currency:
-        return f"{val:,.2f} {currency}".strip()
-    if isinstance(val, float) and val == int(val):
-        return f"{int(val):,}"
-    return f"{val:,.2f}"
+    return f"{val:,.{dec}f}"
 
-def compare_html(current, previous, is_currency=False, currency="", reverse=False):
-    """Returns HTML with value and comparison delta in parentheses."""
-    curr_str = fmt_num(current, is_currency, currency)
-    if previous is None or previous == 0:
-        return f'<span>{curr_str}</span>'
-    delta = current - previous
-    pct   = (delta / previous) * 100 if previous != 0 else 0
-    sign  = "+" if delta >= 0 else ""
-    # reverse: lower = better (e.g. cost)
-    good  = (delta >= 0) if not reverse else (delta <= 0)
-    cls   = "compare-pos" if good else "compare-neg"
-    if abs(pct) < 0.05:
-        cls = "compare-neu"
-    prev_str  = fmt_num(previous, is_currency, currency)
-    delta_str = fmt_num(abs(delta), is_currency, currency)
-    return (
-        f'<span>{curr_str}</span> '
-        f'<span class="metric-compare {cls}">({sign}{delta_str}, {sign}{pct:.1f}%)</span>'
-    )
+def kpi(label, curr, prev=None, dec=2, reverse=False):
+    val_str  = fmt(curr, dec)
+    cmp_html = ""
+    if prev is not None and prev != 0:
+        delta = curr - prev
+        pct   = delta / prev * 100
+        sign  = "+" if delta >= 0 else ""
+        good  = delta >= 0 if not reverse else delta <= 0
+        cls   = "pos" if (good and abs(pct) > 0.05) else ("neg" if abs(pct) > 0.05 else "neu")
+        cmp_html = f'<div class="kpi-cmp {cls}">{sign}{fmt(delta,dec)} ({sign}{pct:.1f}%)</div>'
+    return f"""<div class="kpi-card">
+  <div class="kpi-label">{label}</div>
+  <div class="kpi-value">{val_str}</div>
+  {cmp_html}
+</div>"""
+
+def col_sum(df, col):
+    return float(df[col].sum()) if (df is not None and not df.empty and col in df.columns) else 0.0
 
 # ─────────────────────────────────────────────
-# GA4
+# DATA FETCHING – GA4
 # ─────────────────────────────────────────────
-def build_platform_filter(platform_values):
-    if not platform_values:
+def build_platform_filter(vals):
+    if not vals:
         return None
-    exprs = [
-        FilterExpression(filter=Filter(
-            field_name="platform",
-            string_filter=Filter.StringFilter(
-                match_type=Filter.StringFilter.MatchType.EXACT,
-                value=pv, case_sensitive=False,
-            ),
-        ))
-        for pv in platform_values
-    ]
+    exprs = [FilterExpression(filter=Filter(
+        field_name="platform",
+        string_filter=Filter.StringFilter(
+            match_type=Filter.StringFilter.MatchType.EXACT,
+            value=v, case_sensitive=False,
+        )
+    )) for v in vals]
     return exprs[0] if len(exprs) == 1 else FilterExpression(
         or_group=FilterExpressionList(expressions=exprs)
     )
 
-def get_ga4_data(property_id, start_date, end_date, platform_filter_expr=None):
+def get_ga4_data(property_id, start_date, end_date, platform_expr=None):
     try:
-        request = RunReportRequest(
+        req = RunReportRequest(
             property=f"properties/{property_id}",
             dimensions=[Dimension(name=d) for d in GA4_DIMENSIONS],
             metrics=[Metric(name=m) for m in GA4_METRICS],
             date_ranges=[DateRange(start_date=str(start_date), end_date=str(end_date))],
-            dimension_filter=platform_filter_expr,
+            dimension_filter=platform_expr,
         )
-        response = ga4_client.run_report(request)
+        resp = ga4_client.run_report(req)
         rows = []
-        for row in response.rows:
+        for row in resp.rows:
             rd = {GA4_DIMENSIONS[i]: v.value for i, v in enumerate(row.dimension_values)}
             for i, mv in enumerate(row.metric_values):
                 rd[GA4_METRICS[i]] = mv.value
@@ -234,45 +194,43 @@ def get_ga4_data(property_id, start_date, end_date, platform_filter_expr=None):
                 df[m] = pd.to_numeric(df[m], errors="coerce").fillna(0)
         return df
     except Exception as e:
-        st.warning(f"GA4 błąd dla ID {property_id}: {e}")
+        st.warning(f"GA4 błąd {property_id}: {e}")
         return pd.DataFrame(columns=GA4_DIMENSIONS + GA4_METRICS)
 
 # ─────────────────────────────────────────────
-# META
+# DATA FETCHING – Facebook
 # ─────────────────────────────────────────────
-def get_meta_data(start_date, end_date):
-    query = f"""
-        SELECT CampaignName, CampaignId, DateStart, Clicks, Spend
+def get_facebook_data(start_date, end_date):
+    q = f"""
+        SELECT CampaignName, AdCampaignId, Clicks, Spend
         FROM `facebook-423312.meta.AdInsights`
         WHERE DateStart BETWEEN '{start_date}' AND '{end_date}'
     """
     try:
-        df = bq_client.query(query).to_dataframe()
+        df = bq_client.query(q).to_dataframe()
     except Exception as e:
-        st.warning(f"Meta BQ błąd: {e}")
+        st.warning(f"Facebook BQ błąd: {e}")
         return pd.DataFrame()
     if df.empty:
         return df
-    df["_alias"] = df["CampaignName"].astype(str).apply(extract_meta_alias)
-    df["MPK"]    = df["_alias"].map(META_ALIAS_TO_MPK).fillna("")
-    df["source"] = "Meta"
-    df = df.drop(columns=["_alias"])
-    df["Clicks"]    = pd.to_numeric(df["Clicks"], errors="coerce").fillna(0)
-    df["Spend"]     = pd.to_numeric(df["Spend"],  errors="coerce").fillna(0)
-    df["DateStart"] = pd.to_datetime(df["DateStart"], errors="coerce").dt.date
-    return df
+    df["_alias"]        = df["CampaignName"].astype(str).apply(extract_meta_alias)
+    df["MPK"]           = df["_alias"].map(META_ALIAS_TO_MPK).fillna("")
+    df["Spend"]         = pd.to_numeric(df["Spend"],  errors="coerce").fillna(0)
+    df["Clicks"]        = pd.to_numeric(df["Clicks"], errors="coerce").fillna(0)
+    df["campaign_name"] = df["CampaignName"].astype(str)
+    return df.drop(columns=["_alias"])
 
 # ─────────────────────────────────────────────
-# TIKTOK
+# DATA FETCHING – TikTok
 # ─────────────────────────────────────────────
 def get_tiktok_data(start_date, end_date):
-    query = f"""
-        SELECT advertiser_name, stream_name, date, campaign_id, campaign_name, spend
+    q = f"""
+        SELECT advertiser_name, campaign_id, campaign_name, spend
         FROM `facebook-423312.tiktok_tik_tok`
         WHERE date BETWEEN '{start_date}' AND '{end_date}'
     """
     try:
-        df = bq_client.query(query).to_dataframe()
+        df = bq_client.query(q).to_dataframe()
     except Exception as e:
         st.warning(f"TikTok BQ błąd: {e}")
         return pd.DataFrame()
@@ -284,127 +242,204 @@ def get_tiktok_data(start_date, end_date):
         .fillna(df["advertiser_name"].astype(str).str.strip().map(META_ALIAS_TO_MPK))
         .fillna("")
     )
-    df["source"] = "TikTok"
-    df["spend"]  = pd.to_numeric(df["spend"], errors="coerce").fillna(0)
-    df["date"]   = pd.to_datetime(df["date"], errors="coerce").dt.date
+    df["spend"]         = pd.to_numeric(df["spend"], errors="coerce").fillna(0)
+    df["campaign_name"] = df["campaign_name"].astype(str)
     return df
 
 # ─────────────────────────────────────────────
-# KAMPANIE ŁĄCZONE (BQ spend + GA4 revenue)
+# CLASSIFY GA4 SOURCE → SECTION LABEL
 # ─────────────────────────────────────────────
-def get_campaign_join(
-    meta_df, tiktok_df,
-    ga4_combined_df,
-    selected_mpk_set,
-):
+ADS_SOURCES    = {"google", "google ads", "googleads", "bing", "microsoft"}
+FB_SOURCES     = {"facebook", "instagram", "fb", "meta"}
+TIKTOK_SOURCES = {"tiktok", "tik tok", "tiktok.com"}
+
+def classify_source(src: str) -> str:
+    s = (src or "").lower().strip()
+    if s in ADS_SOURCES:
+        return "ADS"
+    if s in FB_SOURCES:
+        return "Facebook"
+    if s in TIKTOK_SOURCES:
+        return "TikTok"
+    return "Other"
+
+# ─────────────────────────────────────────────
+# BUILD UNIFIED TABLE
+# ─────────────────────────────────────────────
+def build_unified(
+    ga4_df: pd.DataFrame,
+    fb_df:  pd.DataFrame,
+    tt_df:  pd.DataFrame,
+    prop_map: pd.DataFrame,
+    selected_mpk_set: set,
+) -> pd.DataFrame:
     """
-    Łączy kampanie z BQ (spend) z danymi GA4 (revenue) po sessionCampaignName.
-    Zwraca DataFrame z kolumnami: source, MPK, campaign_name, spend, sessions,
-    transactions, revenue_ga4, adcost_ga4, roas
+    Columns: MPK, Brand, Sekcja, Source, Medium, CampaignName,
+             Sesje, Transakcje, Przychód, AdCost (GA4), Spend (BQ)
+
+    Logic:
+      - ADS rows  → cost from GA4 advertiserAdCost, Spend (BQ) = NaN
+      - FB rows   → join GA4 rows to Facebook BQ spend by (MPK, CampaignName)
+      - TikTok    → join GA4 rows to TikTok BQ spend by (MPK, CampaignName)
+      - BQ rows without GA4 match are kept (spend > 0, sessions = 0)
     """
-    frames = []
+    brand_map = prop_map.set_index("MPK")["Brand"].to_dict()
 
-    # Meta
-    if meta_df is not None and not meta_df.empty:
-        m = meta_df[["MPK", "CampaignName", "Spend"]].copy()
-        m = m.rename(columns={"CampaignName": "campaign_name", "Spend": "spend"})
-        m["source"] = "Meta"
-        frames.append(m)
-
-    # TikTok
-    if tiktok_df is not None and not tiktok_df.empty:
-        t = tiktok_df[["MPK", "campaign_name", "spend"]].copy()
-        t["source"] = "TikTok"
-        frames.append(t)
-
-    if not frames:
-        return pd.DataFrame()
-
-    social = pd.concat(frames, ignore_index=True)
-    social = social.groupby(["source", "MPK", "campaign_name"], as_index=False)["spend"].sum()
-
-    # GA4 per campaign
-    if ga4_combined_df is not None and not ga4_combined_df.empty:
-        ga4_camp = (
-            ga4_combined_df
-            .groupby(["MPK", "sessionCampaignName"], as_index=False)
+    # ── GA4 aggregate ──────────────────────────
+    if ga4_df is not None and not ga4_df.empty:
+        ga4_agg = (
+            ga4_df
+            .groupby(["MPK","Brand","sessionSource","sessionMedium","sessionCampaignName"], as_index=False)
             .agg(
-                sessions=("sessions", "sum"),
-                transactions=("transactions", "sum"),
-                revenue_ga4=("totalRevenue", "sum"),
-                adcost_ga4=("advertiserAdCost", "sum"),
+                Sesje          =("sessions",         "sum"),
+                Transakcje     =("transactions",      "sum"),
+                Przychód       =("totalRevenue",      "sum"),
+                adcost_raw     =("advertiserAdCost",  "sum"),
             )
-            .rename(columns={"sessionCampaignName": "campaign_name"})
+            .rename(columns={
+                "sessionSource":       "Source",
+                "sessionMedium":       "Medium",
+                "sessionCampaignName": "CampaignName",
+            })
         )
-        result = social.merge(ga4_camp, on=["MPK", "campaign_name"], how="left")
+        ga4_agg["Sekcja"] = ga4_agg["Source"].apply(classify_source)
     else:
-        result = social.copy()
-        result["sessions"] = 0
-        result["transactions"] = 0
-        result["revenue_ga4"] = 0.0
-        result["adcost_ga4"] = 0.0
+        ga4_agg = pd.DataFrame(columns=[
+            "MPK","Brand","Source","Medium","CampaignName",
+            "Sesje","Transakcje","Przychód","adcost_raw","Sekcja",
+        ])
 
-    result = result.fillna(0)
-    result["roas"] = result.apply(
-        lambda r: r["revenue_ga4"] / r["spend"] if r["spend"] > 0 else 0, axis=1
+    # ── BQ aggregates ─────────────────────────
+    def agg_bq(df, spend_col):
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["MPK","campaign_name","bq_spend"])
+        return (
+            df.groupby(["MPK","campaign_name"], as_index=False)
+            .agg(bq_spend=(spend_col,"sum"))
+        )
+
+    fb_bq = agg_bq(fb_df, "Spend")
+    tt_bq = agg_bq(tt_df, "spend")
+
+    # ── Split GA4 by section ───────────────────
+    ads_part  = ga4_agg[ga4_agg["Sekcja"] == "ADS"].copy()
+    fb_part   = ga4_agg[ga4_agg["Sekcja"] == "Facebook"].copy()
+    tt_part   = ga4_agg[ga4_agg["Sekcja"] == "TikTok"].copy()
+    other_part= ga4_agg[ga4_agg["Sekcja"] == "Other"].copy()
+
+    # ADS: cost = advertiserAdCost from GA4, no BQ spend
+    ads_part["AdCost (GA4)"] = ads_part["adcost_raw"]
+    ads_part["Spend (BQ)"]   = None
+
+    # Other: no cost columns
+    other_part["AdCost (GA4)"] = other_part["adcost_raw"]
+    other_part["Spend (BQ)"]   = None
+
+    def join_bq(ga4_part, bq_df, section_label):
+        """Outer join GA4 rows with BQ spend rows on (MPK, CampaignName)."""
+        bq_df = bq_df.rename(columns={"campaign_name": "CampaignName"})
+
+        if ga4_part.empty and bq_df.empty:
+            return pd.DataFrame()
+
+        if ga4_part.empty:
+            # BQ-only rows
+            out = bq_df.copy()
+            out["Brand"]       = out["MPK"].map(brand_map).fillna("")
+            out["Source"]      = section_label.lower()
+            out["Medium"]      = "paid social"
+            out["Sekcja"]      = section_label
+            out["Sesje"]       = 0.0
+            out["Transakcje"]  = 0.0
+            out["Przychód"]    = 0.0
+            out["AdCost (GA4)"]= 0.0
+            out["Spend (BQ)"]  = out["bq_spend"]
+            return out[["MPK","Brand","Sekcja","Source","Medium","CampaignName",
+                        "Sesje","Transakcje","Przychód","AdCost (GA4)","Spend (BQ)"]]
+
+        merged = ga4_part.merge(bq_df, on=["MPK","CampaignName"], how="outer")
+        # Fill GA4-side NaNs (BQ-only rows)
+        merged["Brand"]      = merged["Brand"].fillna(merged["MPK"].map(brand_map)).fillna("")
+        merged["Source"]     = merged["Source"].fillna(section_label.lower())
+        merged["Medium"]     = merged["Medium"].fillna("paid social")
+        merged["Sekcja"]     = section_label
+        for c in ["Sesje","Transakcje","Przychód","adcost_raw"]:
+            merged[c] = merged[c].fillna(0.0)
+        merged["AdCost (GA4)"] = merged["adcost_raw"]
+        merged["Spend (BQ)"]   = merged["bq_spend"]
+        return merged[["MPK","Brand","Sekcja","Source","Medium","CampaignName",
+                       "Sesje","Transakcje","Przychód","AdCost (GA4)","Spend (BQ)"]]
+
+    fb_joined  = join_bq(fb_part,  fb_bq, "Facebook")
+    tt_joined  = join_bq(tt_part,  tt_bq, "TikTok")
+
+    # Final columns for ADS + Other
+    for part in [ads_part, other_part]:
+        part.drop(columns=["adcost_raw"], inplace=True, errors="ignore")
+
+    keep_cols = ["MPK","Brand","Sekcja","Source","Medium","CampaignName",
+                 "Sesje","Transakcje","Przychód","AdCost (GA4)","Spend (BQ)"]
+    for part in [ads_part, other_part]:
+        for c in keep_cols:
+            if c not in part.columns:
+                part[c] = None
+
+    unified = pd.concat(
+        [ads_part[keep_cols], fb_joined, tt_joined, other_part[keep_cols]],
+        ignore_index=True,
     )
 
+    # Filter MPK
     if selected_mpk_set:
-        result = result[result["MPK"].isin(selected_mpk_set)]
+        unified = unified[unified["MPK"].isin(selected_mpk_set)]
 
-    return result.sort_values("spend", ascending=False).reset_index(drop=True)
+    # Numeric coerce
+    for c in ["Sesje","Transakcje","Przychód","AdCost (GA4)","Spend (BQ)"]:
+        unified[c] = pd.to_numeric(unified[c], errors="coerce")
+
+    return (
+        unified
+        .sort_values(["Sekcja","MPK","Przychód"], ascending=[True,True,False])
+        .reset_index(drop=True)
+    )
 
 # ─────────────────────────────────────────────
-# UI – SIDEBAR
+# SIDEBAR
 # ─────────────────────────────────────────────
 with st.sidebar:
-    st.title("📊 GA4 + Social")
+    st.title("📊 Dashboard")
     st.markdown("---")
 
-    st.subheader("📡 Źródło danych")
-    data_source = st.radio(
-        "Wybierz źródło:",
-        ["GA4", "Meta", "TikTok", "Social (Meta + TikTok)", "Wszystko (GA4 + Social)"],
-        index=4,
-    )
-    use_ga4    = data_source in ("GA4", "Wszystko (GA4 + Social)")
-    use_meta   = data_source in ("Meta", "Social (Meta + TikTok)", "Wszystko (GA4 + Social)")
-    use_tiktok = data_source in ("TikTok", "Social (Meta + TikTok)", "Wszystko (GA4 + Social)")
+    st.subheader("📡 Źródła danych")
+    use_ga4    = st.checkbox("GA4",      value=True)
+    use_fb     = st.checkbox("Facebook", value=True)
+    use_tiktok = st.checkbox("TikTok",   value=True)
 
     st.markdown("---")
 
     if use_ga4:
         st.subheader("📱 Platforma GA4")
-        platform_choice = st.radio(
-            "Źródło danych GA4:",
-            ["Web", "App", "Web + App"],
-            index=2,
-        )
+        platform_choice = st.radio("Platforma:", ["Web","App","Web + App"], index=2)
         st.markdown("---")
     else:
         platform_choice = "Web + App"
 
     st.subheader("🏬 Sklep")
-    brand_options   = sorted(property_mapping["Brand"].unique().tolist())
-    selected_brands = st.multiselect("Brand (brak = wszystkie):", options=brand_options, default=[])
-
-    if selected_brands:
-        filtered_map = property_mapping[property_mapping["Brand"].isin(selected_brands)]
-    else:
-        filtered_map = property_mapping.copy()
+    brand_options   = sorted(property_mapping["Brand"].unique())
+    selected_brands = st.multiselect("Brand:", options=brand_options, default=[])
+    filtered_map    = property_mapping[property_mapping["Brand"].isin(selected_brands)] if selected_brands else property_mapping.copy()
 
     mpk_options   = sorted(filtered_map["MPK"].tolist())
-    selected_mpks = st.multiselect("MPK (brak = wszystkie):", options=mpk_options, default=[])
-
+    selected_mpks = st.multiselect("MPK:", options=mpk_options, default=[])
     if selected_mpks:
         filtered_map = filtered_map[filtered_map["MPK"].isin(selected_mpks)]
 
     st.caption(f"Wybrano {len(filtered_map)} sklep(ów)")
     selected_mpk_set = set(filtered_map["MPK"].tolist())
-    st.markdown("---")
 
+    st.markdown("---")
     st.subheader("📅 Zakres dat")
-    preset_label = st.selectbox("Zakres:", options=list(DATE_PRESETS.keys()), index=0)
+    preset_label = st.selectbox("Preset:", list(DATE_PRESETS.keys()), index=0)
     preset_days  = DATE_PRESETS[preset_label]
 
     if preset_days is not None:
@@ -415,510 +450,250 @@ with st.sidebar:
         start_date = st.date_input("Od:", value=yesterday - timedelta(days=6), max_value=yesterday)
         end_date   = st.date_input("Do:", value=yesterday, max_value=yesterday)
         if start_date > end_date:
-            st.error("Data 'Od' musi być wcześniej niż 'Do'!")
+            st.error("Data 'Od' musi być wcześniejsza!")
 
     st.markdown("---")
     st.subheader("🔁 Porównanie")
-    delta_days = (end_date - start_date).days + 1
+    delta_days   = (end_date - start_date).days + 1
     compare_mode = st.selectbox(
         "Porównaj z:",
-        ["Tydzień wstecz", "Poprzedni okres", "Rok wcześniej", "Własny zakres", "Brak"],
+        ["Tydzień wstecz","Poprzedni okres","Rok wcześniej","Własny zakres","Brak"],
         index=0,
     )
     cmp_start = cmp_end = None
-
     if compare_mode == "Tydzień wstecz":
         cmp_start = start_date - timedelta(weeks=1)
         cmp_end   = end_date   - timedelta(weeks=1)
-        st.caption(f"Okres: {cmp_start} → {cmp_end}")
     elif compare_mode == "Poprzedni okres":
         cmp_end   = start_date - timedelta(days=1)
         cmp_start = cmp_end - timedelta(days=delta_days - 1)
-        st.caption(f"Okres: {cmp_start} → {cmp_end}")
     elif compare_mode == "Rok wcześniej":
         cmp_start = start_date - timedelta(weeks=52)
         cmp_end   = end_date   - timedelta(weeks=52)
-        st.caption(f"Okres: {cmp_start} → {cmp_end}")
     elif compare_mode == "Własny zakres":
-        cmp_start = st.date_input("Porównaj Od:", value=start_date - timedelta(days=delta_days))
-        cmp_end   = st.date_input("Porównaj Do:", value=start_date - timedelta(days=1))
+        cmp_start = st.date_input("Od:", value=start_date - timedelta(days=delta_days))
+        cmp_end   = st.date_input("Do:", value=start_date - timedelta(days=1))
+    if cmp_start:
+        st.caption(f"Cmp: {cmp_start} → {cmp_end}")
 
     st.markdown("---")
-    run_button = st.button("🚀 URUCHOM", use_container_width=True, type="primary")
+    run_btn = st.button("🚀 URUCHOM", use_container_width=True, type="primary")
 
 # ─────────────────────────────────────────────
-# GŁÓWNA TREŚĆ
+# HEADER
 # ─────────────────────────────────────────────
 st.title("📊 GA4 + Social Dashboard")
+h1, h2, h3, h4 = st.columns(4)
+h1.metric("Sklepów",     len(filtered_map))
+h2.metric("GA4",         platform_choice if use_ga4 else "—")
+h3.metric("Zakres",      f"{start_date} → {end_date}")
+h4.metric("Porównanie",  f"{cmp_start} → {cmp_end}" if cmp_start else "—")
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Sklepów",   len(filtered_map))
-col2.metric("Źródło",    data_source)
-col3.metric("Platforma", platform_choice if use_ga4 else "—")
-col4.metric("Zakres",    f"{start_date} → {end_date}")
-
-if not run_button:
-    if "last_results" in st.session_state:
-        st.info("Wyniki z poprzedniego uruchomienia (kliknij 🚀 aby odświeżyć).")
-        _render_results = True
-    else:
-        st.info("Ustaw parametry w panelu bocznym i kliknij **🚀 URUCHOM**.")
+if not run_btn:
+    if "result_main" not in st.session_state:
+        st.info("Ustaw parametry i kliknij **🚀 URUCHOM**.")
         st.stop()
-else:
-    _render_results = False
-
-if start_date > end_date:
-    st.error("Błędny zakres dat!")
-    st.stop()
-if filtered_map.empty:
-    st.error("Nie wybrano żadnych sklepów!")
-    st.stop()
+    else:
+        st.info("Dane z poprzedniego uruchomienia – kliknij 🚀 aby odświeżyć.")
 
 # ─────────────────────────────────────────────
-# POBIERANIE DANYCH
+# FETCH
 # ─────────────────────────────────────────────
-if run_button:
-    combined_ga4 = pd.DataFrame()
-    combined_ga4_cmp = pd.DataFrame()
-    ga4_per_mpk = {}
-    ga4_per_mpk_cmp = {}
+if run_btn:
+    if start_date > end_date:
+        st.error("Błędny zakres dat!")
+        st.stop()
+    if filtered_map.empty:
+        st.error("Nie wybrano sklepów!")
+        st.stop()
 
+    # GA4
+    combined_ga4 = combined_ga4_cmp = pd.DataFrame()
     if use_ga4:
         if platform_choice == "Web + App":
-            platform_expr = None
+            pexpr = None
         elif platform_choice == "Web":
-            platform_expr = build_platform_filter(PLATFORM_FILTERS["Web"])
+            pexpr = build_platform_filter(PLATFORM_FILTERS["Web"])
         else:
-            platform_expr = build_platform_filter(PLATFORM_FILTERS["App"])
+            pexpr = build_platform_filter(PLATFORM_FILTERS["App"])
 
-        progress_bar = st.progress(0)
-        status_text  = st.empty()
-
+        prog = st.progress(0)
+        msg  = st.empty()
         for i, (_, row) in enumerate(filtered_map.iterrows()):
-            status_text.write(f"⏳ GA4 – **{row['MPK']}** ({row['Brand']})…")
-            df_main = get_ga4_data(row["ID_GA4"], start_date, end_date, platform_expr)
-            df_cmp  = (
-                get_ga4_data(row["ID_GA4"], cmp_start, cmp_end, platform_expr)
-                if cmp_start else None
-            )
-
-            def enrich_ga4(df, label):
+            msg.write(f"⏳ GA4 – **{row['MPK']}**…")
+            def enrich(df, r=row):
                 if df is not None and not df.empty:
                     df = df.copy()
-                    df["MPK"]        = row["MPK"]
-                    df["Brand"]      = row["Brand"]
-                    df["Platforma"]  = platform_choice
-                    df["date_range"] = label
+                    df["MPK"]   = r["MPK"]
+                    df["Brand"] = r["Brand"]
                 return df
+            dfm = enrich(get_ga4_data(row["ID_GA4"], start_date, end_date, pexpr))
+            dfc = enrich(get_ga4_data(row["ID_GA4"], cmp_start, cmp_end, pexpr)) if cmp_start else None
+            if dfm is not None and not dfm.empty:
+                combined_ga4 = pd.concat([combined_ga4, dfm], ignore_index=True)
+            if dfc is not None and not dfc.empty:
+                combined_ga4_cmp = pd.concat([combined_ga4_cmp, dfc], ignore_index=True)
+            prog.progress((i + 1) / len(filtered_map))
+        msg.empty(); prog.empty()
 
-            lbl     = f"{start_date.strftime('%d%m%Y')}_{end_date.strftime('%d%m%Y')}"
-            lbl_cmp = (f"{cmp_start.strftime('%d%m%Y')}_{cmp_end.strftime('%d%m%Y')}" if cmp_start else None)
-
-            df_main = enrich_ga4(df_main, lbl)
-            df_cmp  = enrich_ga4(df_cmp,  lbl_cmp)
-
-            if df_main is not None and not df_main.empty:
-                ga4_per_mpk[row["MPK"]] = df_main
-                combined_ga4 = pd.concat([combined_ga4, df_main], ignore_index=True)
-            if df_cmp is not None and not df_cmp.empty:
-                ga4_per_mpk_cmp[row["MPK"]] = df_cmp
-                combined_ga4_cmp = pd.concat([combined_ga4_cmp, df_cmp], ignore_index=True)
-
-            progress_bar.progress((i + 1) / len(filtered_map))
-
-        status_text.empty()
-        progress_bar.empty()
-
-    combined_meta = pd.DataFrame()
-    combined_meta_cmp = pd.DataFrame()
-    if use_meta:
-        with st.spinner("⏳ Pobieranie danych Meta…"):
-            df_meta = get_meta_data(start_date, end_date)
-            if not df_meta.empty and selected_mpk_set:
-                df_meta = df_meta[df_meta["MPK"].isin(selected_mpk_set)]
-            combined_meta = df_meta
+    # Facebook
+    fb_df = fb_df_cmp = pd.DataFrame()
+    if use_fb:
+        with st.spinner("⏳ Facebook…"):
+            fb_df = get_facebook_data(start_date, end_date)
+            if not fb_df.empty and selected_mpk_set:
+                fb_df = fb_df[fb_df["MPK"].isin(selected_mpk_set)]
             if cmp_start:
-                df_meta_cmp = get_meta_data(cmp_start, cmp_end)
-                if not df_meta_cmp.empty and selected_mpk_set:
-                    df_meta_cmp = df_meta_cmp[df_meta_cmp["MPK"].isin(selected_mpk_set)]
-                combined_meta_cmp = df_meta_cmp
+                fb_df_cmp = get_facebook_data(cmp_start, cmp_end)
+                if not fb_df_cmp.empty and selected_mpk_set:
+                    fb_df_cmp = fb_df_cmp[fb_df_cmp["MPK"].isin(selected_mpk_set)]
 
-    combined_tiktok = pd.DataFrame()
-    combined_tiktok_cmp = pd.DataFrame()
+    # TikTok
+    tt_df = tt_df_cmp = pd.DataFrame()
     if use_tiktok:
-        with st.spinner("⏳ Pobieranie danych TikTok…"):
-            df_tt = get_tiktok_data(start_date, end_date)
-            if not df_tt.empty and selected_mpk_set:
-                df_tt = df_tt[df_tt["MPK"].isin(selected_mpk_set)]
-            combined_tiktok = df_tt
+        with st.spinner("⏳ TikTok…"):
+            tt_df = get_tiktok_data(start_date, end_date)
+            if not tt_df.empty and selected_mpk_set:
+                tt_df = tt_df[tt_df["MPK"].isin(selected_mpk_set)]
             if cmp_start:
-                df_tt_cmp = get_tiktok_data(cmp_start, cmp_end)
-                if not df_tt_cmp.empty and selected_mpk_set:
-                    df_tt_cmp = df_tt_cmp[df_tt_cmp["MPK"].isin(selected_mpk_set)]
-                combined_tiktok_cmp = df_tt_cmp
+                tt_df_cmp = get_tiktok_data(cmp_start, cmp_end)
+                if not tt_df_cmp.empty and selected_mpk_set:
+                    tt_df_cmp = tt_df_cmp[tt_df_cmp["MPK"].isin(selected_mpk_set)]
 
-    # Campaign join
-    campaign_df = pd.DataFrame()
-    campaign_cmp_df = pd.DataFrame()
-    if use_meta or use_tiktok:
-        campaign_df = get_campaign_join(
-            combined_meta, combined_tiktok, combined_ga4, selected_mpk_set
-        )
-        if cmp_start:
-            campaign_cmp_df = get_campaign_join(
-                combined_meta_cmp, combined_tiktok_cmp, combined_ga4_cmp, selected_mpk_set
-            )
+    result_main = build_unified(combined_ga4, fb_df, tt_df, property_mapping, selected_mpk_set)
+    result_cmp  = (
+        build_unified(combined_ga4_cmp, fb_df_cmp, tt_df_cmp, property_mapping, selected_mpk_set)
+        if cmp_start else pd.DataFrame()
+    )
 
-    st.session_state["last_results"] = {
-        "combined_ga4":        combined_ga4,
-        "combined_ga4_cmp":    combined_ga4_cmp,
-        "combined_meta":       combined_meta,
-        "combined_meta_cmp":   combined_meta_cmp,
-        "combined_tiktok":     combined_tiktok,
-        "combined_tiktok_cmp": combined_tiktok_cmp,
-        "campaign_df":         campaign_df,
-        "campaign_cmp_df":     campaign_cmp_df,
-        "cmp_start":           cmp_start,
-        "cmp_end":             cmp_end,
-        "use_ga4":             use_ga4,
-        "use_meta":            use_meta,
-        "use_tiktok":          use_tiktok,
-    }
+    st.session_state["result_main"] = result_main
+    st.session_state["result_cmp"]  = result_cmp
+    st.session_state["cmp_active"]  = cmp_start is not None
 
 # ─────────────────────────────────────────────
-# RENDER WYNIKÓW
+# RENDER
 # ─────────────────────────────────────────────
-res = st.session_state.get("last_results", {})
-if not res:
+result_main = st.session_state.get("result_main", pd.DataFrame())
+result_cmp  = st.session_state.get("result_cmp",  pd.DataFrame())
+has_cmp     = st.session_state.get("cmp_active", False) and not result_cmp.empty
+
+if result_main.empty:
+    st.warning("Brak danych do wyświetlenia.")
     st.stop()
-
-combined_ga4        = res.get("combined_ga4",        pd.DataFrame())
-combined_ga4_cmp    = res.get("combined_ga4_cmp",    pd.DataFrame())
-combined_meta       = res.get("combined_meta",       pd.DataFrame())
-combined_meta_cmp   = res.get("combined_meta_cmp",   pd.DataFrame())
-combined_tiktok     = res.get("combined_tiktok",     pd.DataFrame())
-combined_tiktok_cmp = res.get("combined_tiktok_cmp", pd.DataFrame())
-campaign_df         = res.get("campaign_df",         pd.DataFrame())
-campaign_cmp_df     = res.get("campaign_cmp_df",     pd.DataFrame())
-_cmp_start          = res.get("cmp_start")
-_use_ga4            = res.get("use_ga4",    use_ga4)
-_use_meta           = res.get("use_meta",   use_meta)
-_use_tiktok         = res.get("use_tiktok", use_tiktok)
-
-has_cmp = _cmp_start is not None
 
 st.success("✅ Dane pobrane!")
 
-# ── HELPER: metric cards ─────────────────────
-def metric_card(label, current_val, prev_val=None, is_currency=False, currency="", reverse=False):
-    val_html = compare_html(current_val, prev_val, is_currency, currency, reverse) if has_cmp and prev_val is not None else f"<span>{fmt_num(current_val, is_currency, currency)}</span>"
-    return f"""
-<div class="metric-card">
-  <div class="metric-label">{label}</div>
-  <div class="metric-value">{val_html}</div>
-</div>"""
+# ── Global KPIs ────────────────────────────────
+def cmp_val(col):
+    return col_sum(result_cmp, col) if has_cmp else None
 
-def safe_sum(df, col):
-    if df is None or df.empty or col not in df.columns:
-        return 0.0
-    return float(df[col].sum())
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.markdown(kpi("Sesje",        col_sum(result_main,"Sesje"),        cmp_val("Sesje"),        dec=0), unsafe_allow_html=True)
+k2.markdown(kpi("Transakcje",   col_sum(result_main,"Transakcje"),   cmp_val("Transakcje"),   dec=0), unsafe_allow_html=True)
+k3.markdown(kpi("Przychód",     col_sum(result_main,"Przychód"),     cmp_val("Przychód"),     dec=2), unsafe_allow_html=True)
+k4.markdown(kpi("AdCost (ADS)", col_sum(result_main,"AdCost (GA4)"), cmp_val("AdCost (GA4)"),dec=2, reverse=True), unsafe_allow_html=True)
+k5.markdown(kpi("Spend Social", col_sum(result_main,"Spend (BQ)"),   cmp_val("Spend (BQ)"),  dec=2, reverse=True), unsafe_allow_html=True)
 
-def safe_sum_cmp(df, col):
-    if not has_cmp:
-        return None
-    return safe_sum(df, col)
+# ── Inline filters ────────────────────────────
+st.markdown('<div class="sec">Filtry</div>', unsafe_allow_html=True)
+f1, f2, f3, f4 = st.columns([1,1,1,2])
+sec_filter  = f1.selectbox("Sekcja:",  ["Wszystkie"] + sorted(result_main["Sekcja"].dropna().unique()))
+mpk_filter  = f2.selectbox("MPK:",     ["Wszystkie"] + sorted(result_main["MPK"].dropna().unique()))
+med_filter  = f3.selectbox("Medium:",  ["Wszystkie"] + sorted(result_main["Medium"].dropna().unique()))
+camp_search = f4.text_input("Szukaj kampanii:", placeholder="fragment nazwy…")
 
-# ─────────────────────────────────────────────
-# TABS
-# ─────────────────────────────────────────────
-tab_labels = []
-if _use_ga4:            tab_labels.append("📊 GA4")
-if _use_meta or _use_tiktok: tab_labels.append("📣 Social")
-if (_use_meta or _use_tiktok) and _use_ga4: tab_labels.append("🔗 Kampanie")
+def apply_filters(df):
+    if df is None or df.empty:
+        return df
+    if sec_filter  != "Wszystkie": df = df[df["Sekcja"]  == sec_filter]
+    if mpk_filter  != "Wszystkie": df = df[df["MPK"]     == mpk_filter]
+    if med_filter  != "Wszystkie": df = df[df["Medium"]  == med_filter]
+    if camp_search: df = df[df["CampaignName"].str.contains(camp_search, case=False, na=False)]
+    return df
 
-tabs = st.tabs(tab_labels) if tab_labels else []
-tab_map = {name: tab for name, tab in zip(tab_labels, tabs)}
+filtered      = apply_filters(result_main.copy())
+filtered_cmp  = apply_filters(result_cmp.copy()) if has_cmp else pd.DataFrame()
 
-# ══════════════════════════════════════════════
-# TAB: GA4
-# ══════════════════════════════════════════════
-if "📊 GA4" in tab_map:
-    with tab_map["📊 GA4"]:
+# ── Section tabs ──────────────────────────────
+SECTION_ORDER = ["Wszystkie","ADS","Facebook","TikTok","Other"]
+available_secs = [s for s in SECTION_ORDER
+                  if s == "Wszystkie" or s in result_main["Sekcja"].unique()]
+tabs = st.tabs(available_secs)
 
-        # KPI cards
-        ga4_sessions     = safe_sum(combined_ga4, "sessions")
-        ga4_transactions = safe_sum(combined_ga4, "transactions")
-        ga4_revenue      = safe_sum(combined_ga4, "totalRevenue")
-        ga4_adcost       = safe_sum(combined_ga4, "advertiserAdCost")
+NUM_CFG = {
+    "Przychód":     st.column_config.NumberColumn(format="%.2f"),
+    "AdCost (GA4)": st.column_config.NumberColumn(format="%.2f"),
+    "Spend (BQ)":   st.column_config.NumberColumn(format="%.2f"),
+    "Sesje":        st.column_config.NumberColumn(format="%.0f"),
+    "Transakcje":   st.column_config.NumberColumn(format="%.0f"),
+}
 
-        ga4_sessions_c     = safe_sum_cmp(combined_ga4_cmp, "sessions")
-        ga4_transactions_c = safe_sum_cmp(combined_ga4_cmp, "transactions")
-        ga4_revenue_c      = safe_sum_cmp(combined_ga4_cmp, "totalRevenue")
-        ga4_adcost_c       = safe_sum_cmp(combined_ga4_cmp, "advertiserAdCost")
+for tab, sec in zip(tabs, available_secs):
+    with tab:
+        df_sec     = filtered[filtered["Sekcja"] == sec] if sec != "Wszystkie" else filtered
+        df_sec_cmp = (filtered_cmp[filtered_cmp["Sekcja"] == sec]
+                      if (sec != "Wszystkie" and has_cmp)
+                      else (filtered_cmp if has_cmp else pd.DataFrame()))
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.markdown(metric_card("Sesje", ga4_sessions, ga4_sessions_c), unsafe_allow_html=True)
-        c2.markdown(metric_card("Transakcje", ga4_transactions, ga4_transactions_c), unsafe_allow_html=True)
-        c3.markdown(metric_card("Przychód", ga4_revenue, ga4_revenue_c, is_currency=True), unsafe_allow_html=True)
-        c4.markdown(metric_card("Ad Cost (GA4)", ga4_adcost, ga4_adcost_c, is_currency=True, reverse=True), unsafe_allow_html=True)
+        if df_sec.empty:
+            st.info("Brak danych.")
+            continue
 
-        # Tabela GA4 per source/medium/campaign
-        st.markdown('<div class="section-header">Dane GA4 – źródło / medium / kampania</div>', unsafe_allow_html=True)
+        # Section KPIs
+        sk1, sk2, sk3, sk4, sk5 = st.columns(5)
+        def scmp(col):
+            return col_sum(df_sec_cmp, col) if has_cmp else None
+        sk1.markdown(kpi("Sesje",        col_sum(df_sec,"Sesje"),        scmp("Sesje"),        dec=0), unsafe_allow_html=True)
+        sk2.markdown(kpi("Transakcje",   col_sum(df_sec,"Transakcje"),   scmp("Transakcje"),   dec=0), unsafe_allow_html=True)
+        sk3.markdown(kpi("Przychód",     col_sum(df_sec,"Przychód"),     scmp("Przychód"),     dec=2), unsafe_allow_html=True)
+        sk4.markdown(kpi("AdCost (GA4)", col_sum(df_sec,"AdCost (GA4)"), scmp("AdCost (GA4)"),dec=2, reverse=True), unsafe_allow_html=True)
+        sk5.markdown(kpi("Spend (BQ)",   col_sum(df_sec,"Spend (BQ)"),   scmp("Spend (BQ)"),  dec=2, reverse=True), unsafe_allow_html=True)
 
-        if not combined_ga4.empty:
-            ga4_agg = (
-                combined_ga4
-                .groupby(["sessionSource", "sessionMedium", "sessionCampaignName"], as_index=False)
-                .agg(sessions=("sessions","sum"), transactions=("transactions","sum"),
-                     totalRevenue=("totalRevenue","sum"), advertiserAdCost=("advertiserAdCost","sum"))
-                .sort_values("sessions", ascending=False)
+        # Table
+        if has_cmp and not df_sec_cmp.empty:
+            JOIN_KEYS = ["MPK","Sekcja","Source","Medium","CampaignName"]
+            merged = df_sec.merge(
+                df_sec_cmp[JOIN_KEYS + ["Sesje","Transakcje","Przychód","AdCost (GA4)","Spend (BQ)"]].rename(columns={
+                    "Sesje":        "Sesje_p",
+                    "Transakcje":   "Trans_p",
+                    "Przychód":     "Przychód_p",
+                    "AdCost (GA4)": "AdCost_p",
+                    "Spend (BQ)":   "Spend_p",
+                }),
+                on=JOIN_KEYS, how="left"
+            ).fillna(0)
+            merged["Δ Sesje"]    = merged["Sesje"]    - merged["Sesje_p"]
+            merged["Δ Przychód"] = merged["Przychód"] - merged["Przychód_p"]
+            merged["% Przychód"] = merged.apply(
+                lambda r: r["Δ Przychód"] / r["Przychód_p"] * 100 if r["Przychód_p"] != 0 else 0, axis=1
             )
-            # Jeśli jest porównanie – dodaj kolumny delta
-            if has_cmp and not combined_ga4_cmp.empty:
-                ga4_agg_c = (
-                    combined_ga4_cmp
-                    .groupby(["sessionSource", "sessionMedium", "sessionCampaignName"], as_index=False)
-                    .agg(sessions_c=("sessions","sum"), transactions_c=("transactions","sum"),
-                         totalRevenue_c=("totalRevenue","sum"), advertiserAdCost_c=("advertiserAdCost","sum"))
-                )
-                ga4_agg = ga4_agg.merge(ga4_agg_c, on=["sessionSource","sessionMedium","sessionCampaignName"], how="left").fillna(0)
-                for col, col_c in [("sessions","sessions_c"),("transactions","transactions_c"),
-                                   ("totalRevenue","totalRevenue_c"),("advertiserAdCost","advertiserAdCost_c")]:
-                    ga4_agg[f"{col}_delta"] = ga4_agg[col] - ga4_agg[col_c]
-                    ga4_agg[f"{col}_pct"] = ga4_agg.apply(
-                        lambda r: (r[col]-r[col_c])/r[col_c]*100 if r[col_c] != 0 else 0, axis=1
-                    )
-                # Format display
-                display_cols = {
-                    "sessionSource": "Źródło", "sessionMedium": "Medium",
-                    "sessionCampaignName": "Kampania",
-                    "sessions": "Sesje", "sessions_c": "Sesje (cmp)",
-                    "sessions_delta": "Δ Sesje", "sessions_pct": "% Sesje",
-                    "transactions": "Transakcje", "transactions_c": "Transakcje (cmp)",
-                    "totalRevenue": "Przychód", "totalRevenue_c": "Przychód (cmp)",
-                    "totalRevenue_delta": "Δ Przychód",
-                }
-                show_cols = ["sessionSource","sessionMedium","sessionCampaignName",
-                             "sessions","sessions_c","sessions_pct",
-                             "transactions","transactions_c",
-                             "totalRevenue","totalRevenue_c","totalRevenue_delta"]
-                ga4_disp = ga4_agg[show_cols].rename(columns=display_cols)
-            else:
-                ga4_disp = ga4_agg[["sessionSource","sessionMedium","sessionCampaignName",
-                                     "sessions","transactions","totalRevenue","advertiserAdCost"]].rename(columns={
-                    "sessionSource":"Źródło","sessionMedium":"Medium",
-                    "sessionCampaignName":"Kampania","sessions":"Sesje",
-                    "transactions":"Transakcje","totalRevenue":"Przychód","advertiserAdCost":"Ad Cost",
-                })
+            merged["Δ Spend"]    = merged["Spend (BQ)"] - merged["Spend_p"]
 
-            st.dataframe(ga4_disp, use_container_width=True, height=420,
-                         column_config={
-                             "Przychód": st.column_config.NumberColumn(format="%.2f"),
-                             "Przychód (cmp)": st.column_config.NumberColumn(format="%.2f"),
-                             "Δ Przychód": st.column_config.NumberColumn(format="%.2f"),
-                             "% Sesje": st.column_config.NumberColumn(format="%.1f%%"),
-                         })
-            st.caption(f"Wierszy: {len(ga4_disp):,}")
+            show_cols = ["MPK","Brand","Sekcja","Source","Medium","CampaignName",
+                         "Sesje","Sesje_p","Δ Sesje",
+                         "Transakcje","Trans_p",
+                         "Przychód","Przychód_p","Δ Przychód","% Przychód",
+                         "AdCost (GA4)","AdCost_p",
+                         "Spend (BQ)","Spend_p","Δ Spend"]
+            col_cfg = {
+                **NUM_CFG,
+                "Sesje_p":    st.column_config.NumberColumn(label="Sesje (cmp)",        format="%.0f"),
+                "Δ Sesje":    st.column_config.NumberColumn(format="%.0f"),
+                "Trans_p":    st.column_config.NumberColumn(label="Transakcje (cmp)",   format="%.0f"),
+                "Przychód_p": st.column_config.NumberColumn(label="Przychód (cmp)",     format="%.2f"),
+                "Δ Przychód": st.column_config.NumberColumn(format="%.2f"),
+                "% Przychód": st.column_config.NumberColumn(format="%.1f%%"),
+                "AdCost_p":   st.column_config.NumberColumn(label="AdCost (cmp)",       format="%.2f"),
+                "Spend_p":    st.column_config.NumberColumn(label="Spend (cmp)",        format="%.2f"),
+                "Δ Spend":    st.column_config.NumberColumn(format="%.2f"),
+            }
+            st.dataframe(merged[show_cols], use_container_width=True, height=460, column_config=col_cfg)
         else:
-            st.info("Brak danych GA4.")
+            st.dataframe(df_sec, use_container_width=True, height=460, column_config=NUM_CFG)
 
-        # Per MPK summary
-        st.markdown('<div class="section-header">Podsumowanie per MPK</div>', unsafe_allow_html=True)
-        if not combined_ga4.empty:
-            mpk_agg = (
-                combined_ga4
-                .groupby(["MPK","Brand"], as_index=False)
-                .agg(sessions=("sessions","sum"), transactions=("transactions","sum"),
-                     totalRevenue=("totalRevenue","sum"), advertiserAdCost=("advertiserAdCost","sum"))
-                .sort_values("totalRevenue", ascending=False)
-            )
-            if has_cmp and not combined_ga4_cmp.empty:
-                mpk_agg_c = (
-                    combined_ga4_cmp
-                    .groupby(["MPK","Brand"], as_index=False)
-                    .agg(sessions_c=("sessions","sum"), transactions_c=("transactions","sum"),
-                         totalRevenue_c=("totalRevenue","sum"))
-                )
-                mpk_agg = mpk_agg.merge(mpk_agg_c, on=["MPK","Brand"], how="left").fillna(0)
-                for col, col_c in [("sessions","sessions_c"),("transactions","transactions_c"),("totalRevenue","totalRevenue_c")]:
-                    mpk_agg[f"{col}_pct"] = mpk_agg.apply(
-                        lambda r, c=col, cc=col_c: (r[c]-r[cc])/r[cc]*100 if r[cc]!=0 else 0, axis=1
-                    )
-            st.dataframe(mpk_agg, use_container_width=True, height=320)
-
-# ══════════════════════════════════════════════
-# TAB: SOCIAL
-# ══════════════════════════════════════════════
-if "📣 Social" in tab_map:
-    with tab_map["📣 Social"]:
-        meta_spend   = safe_sum(combined_meta,   "Spend")
-        tt_spend     = safe_sum(combined_tiktok, "spend")
-        total_spend  = meta_spend + tt_spend
-
-        meta_spend_c  = safe_sum_cmp(combined_meta_cmp,   "Spend")
-        tt_spend_c    = safe_sum_cmp(combined_tiktok_cmp, "spend")
-        total_spend_c = (meta_spend_c or 0) + (tt_spend_c or 0) if has_cmp else None
-
-        c1, c2, c3 = st.columns(3)
-        c1.markdown(metric_card("Spend łączny", total_spend, total_spend_c, is_currency=True, reverse=True), unsafe_allow_html=True)
-        c2.markdown(metric_card("Spend Meta",   meta_spend,  meta_spend_c,  is_currency=True, reverse=True), unsafe_allow_html=True)
-        c3.markdown(metric_card("Spend TikTok", tt_spend,    tt_spend_c,    is_currency=True, reverse=True), unsafe_allow_html=True)
-
-        # Tabs Meta / TikTok
-        social_tabs = []
-        if _use_meta:   social_tabs.append("📘 Meta")
-        if _use_tiktok: social_tabs.append("🎵 TikTok")
-
-        st_tabs = st.tabs(social_tabs)
-        stab_map = {n: t for n, t in zip(social_tabs, st_tabs)}
-
-        if "📘 Meta" in stab_map:
-            with stab_map["📘 Meta"]:
-                if not combined_meta.empty:
-                    meta_disp = (
-                        combined_meta
-                        .groupby(["MPK","CampaignName"], as_index=False)
-                        .agg(Spend=("Spend","sum"), Clicks=("Clicks","sum"))
-                        .sort_values("Spend", ascending=False)
-                    )
-                    if has_cmp and not combined_meta_cmp.empty:
-                        meta_disp_c = (
-                            combined_meta_cmp
-                            .groupby(["MPK","CampaignName"], as_index=False)
-                            .agg(Spend_c=("Spend","sum"))
-                        )
-                        meta_disp = meta_disp.merge(meta_disp_c, on=["MPK","CampaignName"], how="left").fillna(0)
-                        meta_disp["Spend_delta"] = meta_disp["Spend"] - meta_disp["Spend_c"]
-                        meta_disp["Spend_pct"]   = meta_disp.apply(
-                            lambda r: (r["Spend"]-r["Spend_c"])/r["Spend_c"]*100 if r["Spend_c"]!=0 else 0, axis=1
-                        )
-                    st.dataframe(meta_disp, use_container_width=True, height=420,
-                                 column_config={
-                                     "Spend":       st.column_config.NumberColumn(format="%.2f"),
-                                     "Spend_c":     st.column_config.NumberColumn(label="Spend (cmp)", format="%.2f"),
-                                     "Spend_delta": st.column_config.NumberColumn(label="Δ Spend", format="%.2f"),
-                                     "Spend_pct":   st.column_config.NumberColumn(label="% Spend", format="%.1f%%"),
-                                 })
-                    st.caption(f"Wierszy: {len(meta_disp):,}")
-                else:
-                    st.info("Brak danych Meta.")
-
-        if "🎵 TikTok" in stab_map:
-            with stab_map["🎵 TikTok"]:
-                if not combined_tiktok.empty:
-                    tt_disp = (
-                        combined_tiktok
-                        .groupby(["MPK","campaign_name"], as_index=False)
-                        .agg(spend=("spend","sum"))
-                        .sort_values("spend", ascending=False)
-                    )
-                    if has_cmp and not combined_tiktok_cmp.empty:
-                        tt_disp_c = (
-                            combined_tiktok_cmp
-                            .groupby(["MPK","campaign_name"], as_index=False)
-                            .agg(spend_c=("spend","sum"))
-                        )
-                        tt_disp = tt_disp.merge(tt_disp_c, on=["MPK","campaign_name"], how="left").fillna(0)
-                        tt_disp["spend_delta"] = tt_disp["spend"] - tt_disp["spend_c"]
-                        tt_disp["spend_pct"]   = tt_disp.apply(
-                            lambda r: (r["spend"]-r["spend_c"])/r["spend_c"]*100 if r["spend_c"]!=0 else 0, axis=1
-                        )
-                    st.dataframe(tt_disp, use_container_width=True, height=420,
-                                 column_config={
-                                     "spend":       st.column_config.NumberColumn(format="%.2f"),
-                                     "spend_c":     st.column_config.NumberColumn(label="Spend (cmp)", format="%.2f"),
-                                     "spend_delta": st.column_config.NumberColumn(label="Δ Spend", format="%.2f"),
-                                     "spend_pct":   st.column_config.NumberColumn(label="% Spend", format="%.1f%%"),
-                                 })
-                    st.caption(f"Wierszy: {len(tt_disp):,}")
-                else:
-                    st.info("Brak danych TikTok.")
-
-# ══════════════════════════════════════════════
-# TAB: KAMPANIE (BQ spend + GA4 revenue)
-# ══════════════════════════════════════════════
-if "🔗 Kampanie" in tab_map:
-    with tab_map["🔗 Kampanie"]:
-        st.markdown("""
-        Kampanie łączą **spend z BQ** (Meta / TikTok) z **przychodem i sesjami z GA4**
-        dopasowanymi po nazwie kampanii (`sessionCampaignName`).
-        """)
-
-        if not campaign_df.empty:
-            # KPI
-            camp_spend    = campaign_df["spend"].sum()
-            camp_revenue  = campaign_df["revenue_ga4"].sum()
-            camp_roas_avg = camp_revenue / camp_spend if camp_spend > 0 else 0
-            camp_trans    = campaign_df["transactions"].sum()
-
-            camp_spend_c   = campaign_cmp_df["spend"].sum()   if has_cmp and not campaign_cmp_df.empty else None
-            camp_revenue_c = campaign_cmp_df["revenue_ga4"].sum() if has_cmp and not campaign_cmp_df.empty else None
-            camp_roas_c    = camp_revenue_c / camp_spend_c if (camp_spend_c and camp_spend_c>0) else None
-            camp_trans_c   = campaign_cmp_df["transactions"].sum() if has_cmp and not campaign_cmp_df.empty else None
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.markdown(metric_card("Spend (BQ)", camp_spend, camp_spend_c, is_currency=True, reverse=True), unsafe_allow_html=True)
-            c2.markdown(metric_card("Przychód (GA4)", camp_revenue, camp_revenue_c, is_currency=True), unsafe_allow_html=True)
-            c3.markdown(metric_card("ROAS", camp_roas_avg, camp_roas_c), unsafe_allow_html=True)
-            c4.markdown(metric_card("Transakcje", camp_trans, camp_trans_c), unsafe_allow_html=True)
-
-            st.markdown('<div class="section-header">Kampanie – szczegóły</div>', unsafe_allow_html=True)
-
-            # Filtry inline
-            fi1, fi2 = st.columns(2)
-            with fi1:
-                src_filter = st.multiselect("Źródło:", options=sorted(campaign_df["source"].unique()), default=[])
-            with fi2:
-                mpk_filter = st.multiselect("MPK:", options=sorted(campaign_df["MPK"].unique()), default=[])
-
-            disp = campaign_df.copy()
-            if src_filter: disp = disp[disp["source"].isin(src_filter)]
-            if mpk_filter: disp = disp[disp["MPK"].isin(mpk_filter)]
-
-            disp_renamed = disp.rename(columns={
-                "source": "Źródło", "MPK": "MPK", "campaign_name": "Kampania",
-                "spend": "Spend (BQ)", "sessions": "Sesje", "transactions": "Transakcje",
-                "revenue_ga4": "Przychód (GA4)", "adcost_ga4": "AdCost (GA4)", "roas": "ROAS",
-            })
-
-            st.dataframe(
-                disp_renamed,
-                use_container_width=True,
-                height=480,
-                column_config={
-                    "Spend (BQ)":     st.column_config.NumberColumn(format="%.2f"),
-                    "Przychód (GA4)": st.column_config.NumberColumn(format="%.2f"),
-                    "AdCost (GA4)":   st.column_config.NumberColumn(format="%.2f"),
-                    "ROAS":           st.column_config.NumberColumn(format="%.2f"),
-                }
-            )
-            st.caption(f"Wierszy: {len(disp):,}  |  Spend łączny: {disp['spend'].sum():,.2f}  |  Przychód łączny: {disp['revenue_ga4'].sum():,.2f}")
-
-            # Per source summary
-            st.markdown('<div class="section-header">Podsumowanie per źródło</div>', unsafe_allow_html=True)
-            src_sum = (
-                campaign_df
-                .groupby("source", as_index=False)
-                .agg(
-                    Spend=("spend","sum"), Sessions=("sessions","sum"),
-                    Transactions=("transactions","sum"), Revenue=("revenue_ga4","sum")
-                )
-            )
-            src_sum["ROAS"] = src_sum.apply(lambda r: r["Revenue"]/r["Spend"] if r["Spend"]>0 else 0, axis=1)
-            if has_cmp and not campaign_cmp_df.empty:
-                src_sum_c = (
-                    campaign_cmp_df
-                    .groupby("source", as_index=False)
-                    .agg(Spend_c=("spend","sum"), Revenue_c=("revenue_ga4","sum"))
-                )
-                src_sum = src_sum.merge(src_sum_c, on="source", how="left").fillna(0)
-            st.dataframe(src_sum, use_container_width=True,
-                         column_config={
-                             "Spend":     st.column_config.NumberColumn(format="%.2f"),
-                             "Revenue":   st.column_config.NumberColumn(format="%.2f"),
-                             "Spend_c":   st.column_config.NumberColumn(label="Spend (cmp)", format="%.2f"),
-                             "Revenue_c": st.column_config.NumberColumn(label="Revenue (cmp)", format="%.2f"),
-                             "ROAS":      st.column_config.NumberColumn(format="%.2f"),
-                         })
-        else:
-            st.info("Brak danych kampanii (Meta/TikTok). Upewnij się, że dane BQ są dostępne.")
+        st.caption(
+            f"Wierszy: {len(df_sec):,}  |  "
+            f"Przychód: {col_sum(df_sec,'Przychód'):,.2f}  |  "
+            f"Spend: {col_sum(df_sec,'Spend (BQ)'):,.2f}  |  "
+            f"AdCost: {col_sum(df_sec,'AdCost (GA4)'):,.2f}"
+        )
