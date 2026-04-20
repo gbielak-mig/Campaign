@@ -189,7 +189,7 @@ def get_facebook_data(start_date, end_date):
         WHERE DateStart BETWEEN '{start_date}' AND '{end_date}'
     """
     try:
-        df = bq_client.query(q).to_dataframe()
+        df = bq_client.query(q, location="europe-west3").to_dataframe()
     except Exception as e:
         st.warning(f"Facebook BQ błąd: {e}")
         return pd.DataFrame()
@@ -212,7 +212,8 @@ def get_tiktok_data(start_date, end_date):
         WHERE date BETWEEN '{start_date}' AND '{end_date}'
     """
     try:
-        df = bq_client.query(q, project="facebook-423312").to_dataframe()
+        job_config = bigquery.QueryJobConfig()
+        df = bq_client.query(q, job_config=job_config, location="europe-west3").to_dataframe()
     except Exception as e:
         st.warning(f"TikTok BQ błąd: {e}")
         return pd.DataFrame()
