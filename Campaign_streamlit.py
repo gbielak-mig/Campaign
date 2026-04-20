@@ -101,7 +101,6 @@ def get_bq_client():
     )
     return bigquery.Client(
         credentials=creds,
-        project="facebook-423312",
         location="europe-west3",
     )
 
@@ -209,7 +208,7 @@ def get_facebook_data(start_date, end_date):
 def get_tiktok_data(start_date, end_date):
     q = f"""
         SELECT advertiser_name, campaign_id, campaign_name, spend
-        FROM `facebook-423312.tiktok_tik_tok`
+        FROM `facebook-423312.tiktok_tik_tok.tiktok_tik_tok`
         WHERE date BETWEEN '{start_date}' AND '{end_date}'
     """
     try:
