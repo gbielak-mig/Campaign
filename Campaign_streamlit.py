@@ -212,7 +212,7 @@ def get_tiktok_data(start_date, end_date):
         WHERE date BETWEEN '{start_date}' AND '{end_date}'
     """
     try:
-        df = bq_client.query(q).to_dataframe()
+        df = bq_client.query(q, project="facebook-423312").to_dataframe()
     except Exception as e:
         st.warning(f"TikTok BQ błąd: {e}")
         return pd.DataFrame()
@@ -469,10 +469,9 @@ if st.session_state.get("last_params") != params_key:
 
 # Czekaj 5 sekund po ostatniej zmianie
 pending_at = st.session_state.get("pending_at", 0)
-secs_left  = 5 - (time.time() - pending_at)
+secs_left  = 2 - (time.time() - pending_at)
 
 if secs_left > 0:
-    st.info(f"⏳ Odświeżanie za {int(secs_left) + 1}s…")
     time.sleep(1)
     st.rerun()
 
