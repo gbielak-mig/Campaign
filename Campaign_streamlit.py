@@ -89,7 +89,6 @@ def get_ga4_client():
     )
     return BetaAnalyticsDataClient(credentials=creds)
 
-@st.cache_resource
 def get_bq_client():
     creds = service_account.Credentials.from_service_account_info(
         st.secrets["gcp_service_account"],
@@ -99,10 +98,7 @@ def get_bq_client():
             "https://www.googleapis.com/auth/cloud-platform",
         ],
     )
-    return bigquery.Client(
-        credentials=creds,
-        location="europe-west3",
-    )
+    return bigquery.Client(credentials=creds)
 
 try:
     ga4_client = get_ga4_client()
@@ -208,11 +204,11 @@ def get_facebook_data(start_date, end_date):
 def get_tiktok_data(start_date, end_date):
     q = f"""
         SELECT advertiser_name, campaign_id, campaign_name, spend
-        FROM `facebook-423312.tiktok_tik_tok.tiktok_tik_tok`
+        FROM `facebook-423312.tiktok_tik_tok`
         WHERE date BETWEEN '{start_date}' AND '{end_date}'
     """
     try:
-        df = bq_client.query(q).to_dataframe()
+        df = bq_client.query(q, location="europe-west3").to_dataframe()
     except Exception as e:
         st.warning(f"TikTok BQ błąd: {e}")
         return pd.DataFrame()
