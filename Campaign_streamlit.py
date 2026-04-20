@@ -101,7 +101,8 @@ def get_bq_client():
     )
     return bigquery.Client(
         credentials=creds,
-        project=st.secrets["gcp_service_account"]["project_id"],
+        project="facebook-423312",
+        location="europe-west3",
     )
 
 try:
@@ -212,8 +213,7 @@ def get_tiktok_data(start_date, end_date):
         WHERE date BETWEEN '{start_date}' AND '{end_date}'
     """
     try:
-        job_config = bigquery.QueryJobConfig()
-        df = bq_client.query(q, job_config=job_config, location="europe-west3").to_dataframe()
+        df = bq_client.query(q).to_dataframe()
     except Exception as e:
         st.warning(f"TikTok BQ błąd: {e}")
         return pd.DataFrame()
@@ -232,119 +232,174 @@ def get_tiktok_data(start_date, end_date):
 # ─────────────────────────────────────────────
 # BUILD RESULT TABLE
 # ─────────────────────────────────────────────
-def build_table(
-    ga4_df:       pd.DataFrame,
-    fb_df:        pd.DataFrame,
-    tt_df:        pd.DataFrame,
-    prop_map:     pd.DataFrame,
-    selected_mpk_set: set,
-    source_filter: str,   # "ADS" | "Meta" | "TikTok" | "Wszystkie"
+def _join_ga4_bq(
+    ga4_part:   pd.DataFrame,   # cols: MPK, Brand, CampaignName, Przychód
+    bq_part:    pd.DataFrame,   # cols: MPK, CampaignId, CampaignName, Brand, Spend
+    brand_map:  dict,
+    label:      str,
 ) -> pd.DataFrame:
     """
-    Zwraca tabelkę: MPK, Brand, Źródło, CampaignName, Przychód, Spend
-    - ADS:    Spend = advertiserAdCost z GA4
-    - Meta:   Spend = Spend z BQ (Facebook)
-    - TikTok: Spend = spend z BQ (TikTok)
+    Outer join GA4 (revenue) z BQ (spend).
+    Próbuje łączyć po CampaignId (wyciągniętym z nazwy GA4) jeśli możliwe,
+    fallback na CampaignName w obrębie tego samego MPK.
     """
+    COLS = ["MPK","Brand","Źródło","CampaignId","CampaignName","Przychód","Spend"]
+
+    if ga4_part.empty and bq_part.empty:
+        return pd.DataFrame(columns=COLS)
+
+    if ga4_part.empty:
+        out = bq_part.copy()
+        out["Przychód"] = 0.0
+        out["Źródło"]   = label
+        for c in COLS:
+            if c not in out.columns:
+                out[c] = ""
+        return out[COLS]
+
+    if bq_part.empty:
+        out = ga4_part.copy()
+        out["Spend"]    = 0.0
+        out["CampaignId"] = ""
+        out["Źródło"]   = label
+        for c in COLS:
+            if c not in out.columns:
+                out[c] = ""
+        return out[COLS]
+
+    # BQ ma CampaignId — próbuj dopasować po MPK + CampaignId zawartym w nazwie GA4
+    # GA4 sessionCampaignName często wygląda jak "SCZ-12345678_Nazwa" lub po prostu nazwa
+    # Wyciągamy liczby z CampaignName GA4 i porównujemy z CampaignId BQ
+    ga4_part = ga4_part.copy()
+    bq_part  = bq_part.copy()
+
+    ga4_part["_id_from_name"] = (
+        ga4_part["CampaignName"].astype(str)
+        .str.extract(r"(\d{10,})"", expand=False)   # Meta campaign ID ma 10+ cyfr
+        .fillna("")
+    )
+    bq_part["CampaignId"] = bq_part["CampaignId"].astype(str).str.strip()
+
+    # Merge po MPK + ID
+    by_id = ga4_part[ga4_part["_id_from_name"] != ""].merge(
+        bq_part.rename(columns={"CampaignName": "CampaignName_bq"}),
+        left_on  =["MPK", "_id_from_name"],
+        right_on =["MPK", "CampaignId"],
+        how="inner",
+    )
+    by_id["CampaignName"] = by_id["CampaignName_bq"].fillna(by_id["CampaignName"])
+
+    matched_ga4_idx = by_id.index if not by_id.empty else pd.Index([])
+    matched_bq_ids  = set(by_id["CampaignId"].dropna()) if not by_id.empty else set()
+
+    # Reszta GA4 i BQ — merge po nazwie
+    ga4_rest = ga4_part[~ga4_part["_id_from_name"].isin(matched_bq_ids)].copy()
+    bq_rest  = bq_part[~bq_part["CampaignId"].isin(matched_bq_ids)].copy()
+
+    by_name = ga4_rest.merge(
+        bq_rest[["MPK","CampaignId","CampaignName","Brand","Spend"]],
+        on=["MPK","CampaignName"],
+        how="outer",
+    )
+
+    # Złącz oba wyniki
+    frames = []
+    if not by_id.empty:
+        frames.append(by_id[["MPK","Brand","CampaignId","CampaignName","Przychód","Spend"]])
+    if not by_name.empty:
+        frames.append(by_name[["MPK","Brand","CampaignId","CampaignName","Przychód","Spend"]])
+
+    if not frames:
+        return pd.DataFrame(columns=COLS)
+
+    merged = pd.concat(frames, ignore_index=True)
+    merged["Brand"]      = merged["Brand"].fillna(merged["MPK"].map(brand_map)).fillna("")
+    merged["CampaignId"] = merged["CampaignId"].fillna("")
+    merged["Przychód"]   = merged["Przychód"].fillna(0.0)
+    merged["Spend"]      = merged["Spend"].fillna(0.0)
+    merged["Źródło"]     = label
+    return merged[COLS]
+
+
+def build_table(
+    ga4_df:          pd.DataFrame,
+    fb_df:           pd.DataFrame,
+    tt_df:           pd.DataFrame,
+    prop_map:        pd.DataFrame,
+    selected_mpk_set: set,
+    source_filter:   str,
+) -> pd.DataFrame:
     brand_map = prop_map.set_index("MPK")["Brand"].to_dict()
     rows = []
 
-    # ── GA4 – ADS ────────────────────────────
+    # ── ADS: tylko GA4, Spend = advertiserAdCost ──
     if source_filter in ("ADS", "Wszystkie") and ga4_df is not None and not ga4_df.empty:
-        ads_df = ga4_df[ga4_df["sessionSource"].str.lower().str.strip().isin(ADS_SOURCES)].copy()
-        if not ads_df.empty:
+        ads_slice = ga4_df[ga4_df["sessionSource"].str.lower().str.strip().isin(ADS_SOURCES)].copy()
+        if not ads_slice.empty:
             agg = (
-                ads_df
-                .groupby(["MPK", "Brand", "sessionCampaignName"], as_index=False)
-                .agg(
-                    Przychód=("totalRevenue",     "sum"),
-                    Spend   =("advertiserAdCost", "sum"),
-                )
-                .rename(columns={"sessionCampaignName": "CampaignName"})
+                ads_slice
+                .groupby(["MPK","Brand","sessionCampaignName"], as_index=False)
+                .agg(Przychód=("totalRevenue","sum"), Spend=("advertiserAdCost","sum"))
+                .rename(columns={"sessionCampaignName":"CampaignName"})
             )
-            agg["Źródło"] = "ADS"
-            rows.append(agg[["MPK","Brand","Źródło","CampaignName","Przychód","Spend"]])
+            agg["Źródło"]     = "ADS"
+            agg["CampaignId"] = ""
+            rows.append(agg[["MPK","Brand","Źródło","CampaignId","CampaignName","Przychód","Spend"]])
 
-    # ── Meta – GA4 revenue + BQ spend ────────
+    # ── Meta: BQ spend + GA4 revenue ──────────────
     if source_filter in ("Meta", "Wszystkie"):
-        # GA4 revenue dla Meta
         meta_ga4 = pd.DataFrame()
         if ga4_df is not None and not ga4_df.empty:
-            meta_slice = ga4_df[ga4_df["sessionSource"].str.lower().str.strip().isin(META_SOURCES)].copy()
-            if not meta_slice.empty:
+            sl = ga4_df[ga4_df["sessionSource"].str.lower().str.strip().isin(META_SOURCES)].copy()
+            if not sl.empty:
                 meta_ga4 = (
-                    meta_slice
-                    .groupby(["MPK", "Brand", "sessionCampaignName"], as_index=False)
-                    .agg(Przychód=("totalRevenue", "sum"))
-                    .rename(columns={"sessionCampaignName": "CampaignName"})
+                    sl.groupby(["MPK","Brand","sessionCampaignName"], as_index=False)
+                    .agg(Przychód=("totalRevenue","sum"))
+                    .rename(columns={"sessionCampaignName":"CampaignName"})
                 )
 
-        # BQ spend dla Meta
         meta_bq = pd.DataFrame()
         if fb_df is not None and not fb_df.empty:
             meta_bq = (
-                fb_df
-                .groupby(["MPK", "campaign_name"], as_index=False)
-                .agg(Spend=("Spend", "sum"))
-                .rename(columns={"campaign_name": "CampaignName"})
+                fb_df.groupby(["MPK","CampaignId","campaign_name"], as_index=False)
+                .agg(Spend=("Spend","sum"))
+                .rename(columns={"campaign_name":"CampaignName"})
             )
-            meta_bq["Brand"] = meta_bq["MPK"].map(brand_map).fillna("")
+            meta_bq["CampaignId"] = meta_bq["CampaignId"].astype(str)
+            meta_bq["Brand"]      = meta_bq["MPK"].map(brand_map).fillna("")
 
-        if not meta_ga4.empty or not meta_bq.empty:
-            if meta_ga4.empty:
-                merged = meta_bq.copy()
-                merged["Przychód"] = 0.0
-            elif meta_bq.empty:
-                merged = meta_ga4.copy()
-                merged["Spend"] = 0.0
-            else:
-                merged = meta_ga4.merge(meta_bq[["MPK","CampaignName","Spend"]], on=["MPK","CampaignName"], how="outer")
-                merged["Brand"]    = merged["Brand"].fillna(merged["MPK"].map(brand_map)).fillna("")
-                merged["Przychód"] = merged["Przychód"].fillna(0.0)
-                merged["Spend"]    = merged["Spend"].fillna(0.0)
-            merged["Źródło"] = "Meta"
-            rows.append(merged[["MPK","Brand","Źródło","CampaignName","Przychód","Spend"]])
+        joined = _join_ga4_bq(meta_ga4, meta_bq, brand_map, "Meta")
+        if not joined.empty:
+            rows.append(joined)
 
-    # ── TikTok – GA4 revenue + BQ spend ──────
+    # ── TikTok: BQ spend + GA4 revenue ────────────
     if source_filter in ("TikTok", "Wszystkie"):
         tt_ga4 = pd.DataFrame()
         if ga4_df is not None and not ga4_df.empty:
-            tt_slice = ga4_df[ga4_df["sessionSource"].str.lower().str.strip().isin(TIKTOK_SOURCES)].copy()
-            if not tt_slice.empty:
+            sl = ga4_df[ga4_df["sessionSource"].str.lower().str.strip().isin(TIKTOK_SOURCES)].copy()
+            if not sl.empty:
                 tt_ga4 = (
-                    tt_slice
-                    .groupby(["MPK", "Brand", "sessionCampaignName"], as_index=False)
-                    .agg(Przychód=("totalRevenue", "sum"))
-                    .rename(columns={"sessionCampaignName": "CampaignName"})
+                    sl.groupby(["MPK","Brand","sessionCampaignName"], as_index=False)
+                    .agg(Przychód=("totalRevenue","sum"))
+                    .rename(columns={"sessionCampaignName":"CampaignName"})
                 )
 
         tt_bq = pd.DataFrame()
         if tt_df is not None and not tt_df.empty:
             tt_bq = (
-                tt_df
-                .groupby(["MPK", "campaign_name"], as_index=False)
-                .agg(Spend=("spend", "sum"))
-                .rename(columns={"campaign_name": "CampaignName"})
+                tt_df.groupby(["MPK","campaign_id","campaign_name"], as_index=False)
+                .agg(Spend=("spend","sum"))
+                .rename(columns={"campaign_id":"CampaignId","campaign_name":"CampaignName"})
             )
-            tt_bq["Brand"] = tt_bq["MPK"].map(brand_map).fillna("")
+            tt_bq["CampaignId"] = tt_bq["CampaignId"].astype(str)
+            tt_bq["Brand"]      = tt_bq["MPK"].map(brand_map).fillna("")
 
-        if not tt_ga4.empty or not tt_bq.empty:
-            if tt_ga4.empty:
-                merged = tt_bq.copy()
-                merged["Przychód"] = 0.0
-            elif tt_bq.empty:
-                merged = tt_ga4.copy()
-                merged["Spend"] = 0.0
-            else:
-                merged = tt_ga4.merge(tt_bq[["MPK","CampaignName","Spend"]], on=["MPK","CampaignName"], how="outer")
-                merged["Brand"]    = merged["Brand"].fillna(merged["MPK"].map(brand_map)).fillna("")
-                merged["Przychód"] = merged["Przychód"].fillna(0.0)
-                merged["Spend"]    = merged["Spend"].fillna(0.0)
-            merged["Źródło"] = "TikTok"
-            rows.append(merged[["MPK","Brand","Źródło","CampaignName","Przychód","Spend"]])
+        joined = _join_ga4_bq(tt_ga4, tt_bq, brand_map, "TikTok")
+        if not joined.empty:
+            rows.append(joined)
 
     if not rows:
-        return pd.DataFrame(columns=["MPK","Brand","Źródło","CampaignName","Przychód","Spend"])
+        return pd.DataFrame(columns=["MPK","Brand","Źródło","CampaignId","CampaignName","Przychód","Spend"])
 
     result = pd.concat(rows, ignore_index=True)
 
