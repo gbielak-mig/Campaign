@@ -233,79 +233,74 @@ def get_tiktok_data(start_date, end_date):
 # BUILD RESULT TABLE
 # ─────────────────────────────────────────────
 def _join_ga4_bq(
-    ga4_part:   pd.DataFrame,   # cols: MPK, Brand, CampaignName, Przychód
-    bq_part:    pd.DataFrame,   # cols: MPK, CampaignId, CampaignName, Brand, Spend
-    brand_map:  dict,
-    label:      str,
+    ga4_part:  pd.DataFrame,
+    bq_part:   pd.DataFrame,
+    brand_map: dict,
+    label:     str,
 ) -> pd.DataFrame:
-    """
-    Outer join GA4 (revenue) z BQ (spend).
-    Próbuje łączyć po CampaignId (wyciągniętym z nazwy GA4) jeśli możliwe,
-    fallback na CampaignName w obrębie tego samego MPK.
-    """
     COLS = ["MPK","Brand","Źródło","CampaignId","CampaignName","Przychód","Spend"]
+
+    def _ensure(df):
+        for c in COLS:
+            if c not in df.columns:
+                df[c] = "" if c in ("Brand","Źródło","CampaignId","CampaignName") else 0.0
+        return df
 
     if ga4_part.empty and bq_part.empty:
         return pd.DataFrame(columns=COLS)
 
     if ga4_part.empty:
-        out = bq_part.copy()
+        out = _ensure(bq_part.copy())
         out["Przychód"] = 0.0
         out["Źródło"]   = label
-        for c in COLS:
-            if c not in out.columns:
-                out[c] = ""
         return out[COLS]
 
     if bq_part.empty:
-        out = ga4_part.copy()
-        out["Spend"]    = 0.0
+        out = _ensure(ga4_part.copy())
+        out["Spend"]      = 0.0
         out["CampaignId"] = ""
-        out["Źródło"]   = label
-        for c in COLS:
-            if c not in out.columns:
-                out[c] = ""
+        out["Źródło"]     = label
         return out[COLS]
 
-    # BQ ma CampaignId — próbuj dopasować po MPK + CampaignId zawartym w nazwie GA4
-    # GA4 sessionCampaignName często wygląda jak "SCZ-12345678_Nazwa" lub po prostu nazwa
-    # Wyciągamy liczby z CampaignName GA4 i porównujemy z CampaignId BQ
-    ga4_part = ga4_part.copy()
-    bq_part  = bq_part.copy()
+    ga4 = ga4_part.copy()
+    bq  = bq_part.copy()
+    bq["CampaignId"] = bq["CampaignId"].astype(str).str.strip()
 
-    ga4_part["_id_from_name"] = (
-        ga4_part["CampaignName"].astype(str)
-        .str.extract(r"(\d{10,})", expand=False)
-        .fillna("")
-    )
-    bq_part["CampaignId"] = bq_part["CampaignId"].astype(str).str.strip()
+    # Próba dopasowania po ID wyciągniętym z nazwy GA4 (10+ cyfr)
+    ga4["_id"] = ga4["CampaignName"].astype(str).str.extract(r"(\d{10,})", expand=False).fillna("")
+    matched_bq_ids = set()
 
-    # Merge po MPK + ID
-    by_id = ga4_part[ga4_part["_id_from_name"] != ""].merge(
-        bq_part.rename(columns={"CampaignName": "CampaignName_bq"}),
-        left_on  =["MPK", "_id_from_name"],
-        right_on =["MPK", "CampaignId"],
+    frames = []
+
+    by_id = ga4[ga4["_id"] != ""].merge(
+        bq.rename(columns={"CampaignName": "_bq_name"}),
+        left_on=["MPK","_id"], right_on=["MPK","CampaignId"],
         how="inner",
     )
-    by_id["CampaignName"] = by_id["CampaignName_bq"].fillna(by_id["CampaignName"])
+    if not by_id.empty:
+        by_id["CampaignName"] = by_id["_bq_name"].fillna(by_id["CampaignName"])
+        matched_bq_ids = set(by_id["CampaignId"].dropna().astype(str))
+        row = by_id[["MPK","Brand","CampaignId","CampaignName","Przychód","Spend"]].copy()
+        row["Brand"] = row["Brand"].fillna(row["MPK"].map(brand_map)).fillna("")
+        frames.append(row)
 
-    matched_ga4_idx = by_id.index if not by_id.empty else pd.Index([])
-    matched_bq_ids  = set(by_id["CampaignId"].dropna()) if not by_id.empty else set()
+    # Reszta — outer merge po nazwie
+    ga4_rest = ga4[~ga4["_id"].isin(matched_bq_ids)].copy()
+    bq_rest  = bq[~bq["CampaignId"].isin(matched_bq_ids)].copy()
 
-    # Reszta GA4 i BQ — merge po nazwie
-    ga4_rest = ga4_part[~ga4_part["_id_from_name"].isin(matched_bq_ids)].copy()
-    bq_rest  = bq_part[~bq_part["CampaignId"].isin(matched_bq_ids)].copy()
-
-    by_name = ga4_rest.merge(
+    by_name = ga4_rest[["MPK","Brand","CampaignName","Przychód"]].merge(
         bq_rest[["MPK","CampaignId","CampaignName","Brand","Spend"]],
         on=["MPK","CampaignName"],
         how="outer",
+        suffixes=("_ga4","_bq"),
     )
-
-    # Złącz oba wyniki
-    frames = []
-    if not by_id.empty:
-        frames.append(by_id[["MPK","Brand","CampaignId","CampaignName","Przychód","Spend"]])
+    # Scalamy Brand z obu stron
+    by_name["Brand"] = by_name.get("Brand_ga4", pd.Series(dtype=str)).fillna(
+        by_name.get("Brand_bq", pd.Series(dtype=str))
+    ).fillna(by_name["MPK"].map(brand_map)).fillna("")
+    by_name["CampaignId"] = by_name.get("CampaignId", pd.Series(dtype=str)).fillna("")
+    by_name["Przychód"]   = by_name.get("Przychód",   pd.Series(dtype=float)).fillna(0.0)
+    by_name["Spend"]      = by_name.get("Spend",      pd.Series(dtype=float)).fillna(0.0)
     if not by_name.empty:
         frames.append(by_name[["MPK","Brand","CampaignId","CampaignName","Przychód","Spend"]])
 
@@ -313,10 +308,9 @@ def _join_ga4_bq(
         return pd.DataFrame(columns=COLS)
 
     merged = pd.concat(frames, ignore_index=True)
-    merged["Brand"]      = merged["Brand"].fillna(merged["MPK"].map(brand_map)).fillna("")
-    merged["CampaignId"] = merged["CampaignId"].fillna("")
-    merged["Przychód"]   = merged["Przychód"].fillna(0.0)
-    merged["Spend"]      = merged["Spend"].fillna(0.0)
+    for c in ["Przychód","Spend"]:
+        merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0.0)
+    merged["CampaignId"] = merged["CampaignId"].fillna("").astype(str)
     merged["Źródło"]     = label
     return merged[COLS]
 
