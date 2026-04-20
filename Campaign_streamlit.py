@@ -362,7 +362,8 @@ def build_table(
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_all(mpk_tuple, start_date, end_date, platform_choice, id_map_json):
     """Pobiera dane GA4 + BQ dla podanych parametrów."""
-    id_map = pd.read_json(id_map_json)
+    from io import StringIO
+    id_map = pd.read_json(StringIO(id_map_json))
 
     if platform_choice == "Web + App":
         pexpr = None
