@@ -275,7 +275,7 @@ def _join_ga4_bq(
 
     ga4_part["_id_from_name"] = (
         ga4_part["CampaignName"].astype(str)
-        .str.extract(r"(\d{10,})"", expand=False)   # Meta campaign ID ma 10+ cyfr
+        .str.extract(r"(\d{10,})", expand=False)
         .fillna("")
     )
     bq_part["CampaignId"] = bq_part["CampaignId"].astype(str).str.strip()
