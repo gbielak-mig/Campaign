@@ -83,6 +83,164 @@ if not st.session_state.get("authenticated"):
             st.error("❌ Błędne hasło!")
     st.stop()
 
+
+
+def normalize_meta_campaign(name: str) -> str:
+    """Dodaje F_ prefix do nazwy kampanii z Meta/TikTok."""
+    name = str(name).strip()
+    if not name.startswith("F_"):
+        name = "F_" + name
+    return name
+
+def strip_suffix_variants(name: str) -> list[str]:
+    """
+    Zwraca listę wariantów nazwy przez stopniowe obcinanie
+    ostatnich segmentów po myślniku.
+    Np. "F_X-Y-Z-marża-nl" → ["F_X-Y-Z-marża-nl", "F_X-Y-Z-marża", "F_X-Y-Z", "F_X-Y", "F_X"]
+    """
+    variants = [name]
+    parts = name.split("-")
+    for i in range(len(parts) - 1, 0, -1):
+        variants.append("-".join(parts[:i]))
+    return variants
+
+def match_ga4_to_bq(ga4_name: str, bq_lookup: dict) -> str | None:
+    """
+    Próbuje dopasować nazwę kampanii z GA4 do BQ (Meta/TikTok)
+    przez stopniowe obcinanie sufixów.
+    bq_lookup: {normalized_campaign_name: original_bq_name}
+    Zwraca dopasowaną nazwę BQ lub None.
+    """
+    for variant in strip_suffix_variants(ga4_name):
+        if variant in bq_lookup:
+            return bq_lookup[variant]
+    return None
+
+
+
+def build_ga4_table(
+    combined_ga4: pd.DataFrame,
+    fb_df:        pd.DataFrame,
+    tt_df:        pd.DataFrame,
+    selected_mpk_set: set,
+) -> pd.DataFrame:
+    """
+    Tabela 1: GA4 przychody + koszty, z CampaignName uzupełnionym/dopasowanym
+    do nazw z Meta i TikTok (przez stopniowe obcinanie sufixów).
+    """
+    if combined_ga4.empty:
+        return pd.DataFrame(columns=[
+            "MPK","Brand","Źródło","sessionMedium","CampaignName",
+            "Sessions","Transactions","Revenue","AdCost"
+        ])
+
+    df = combined_ga4.copy()
+
+    # Klasyfikacja źródła
+    df["Źródło"] = df["sessionSource"].str.lower().str.strip().apply(
+        lambda s: "ADS"    if s in ADS_SOURCES
+        else     ("Meta"   if s in META_SOURCES
+        else     ("TikTok" if s in TIKTOK_SOURCES else None))
+    )
+    # Tylko ADS / Meta / TikTok
+    df = df[df["Źródło"].notna()].copy()
+
+    # Agreguj GA4 po kampanii
+    ga4_agg = (
+        df.groupby(["MPK","Brand","Źródło","sessionMedium","sessionCampaignName"], as_index=False)
+        .agg(
+            Sessions     =("sessions",        "sum"),
+            Transactions =("transactions",     "sum"),
+            Revenue      =("totalRevenue",     "sum"),
+            AdCost       =("advertiserAdCost", "sum"),
+        )
+        .rename(columns={"sessionCampaignName": "CampaignName"})
+    )
+
+    # ── Buduj lookup: normalized_name → oryginalny BQ name ──────────
+    # Meta lookup: "F_" + oryginalna nazwa
+    meta_lookup = {}
+    if fb_df is not None and not fb_df.empty:
+        for name in fb_df["CampaignName"].dropna().unique():
+            normalized = normalize_meta_campaign(name)
+            meta_lookup[normalized] = name  # zachowaj oryginał BQ
+
+    # TikTok lookup: "F_" + oryginalna nazwa
+    tiktok_lookup = {}
+    if tt_df is not None and not tt_df.empty:
+        for name in tt_df["campaign_name"].dropna().unique():
+            normalized = normalize_meta_campaign(name)
+            tiktok_lookup[normalized] = name
+
+    # ── Dopasuj CampaignName z GA4 do BQ ────────────────────────────
+    def resolve_campaign_name(row):
+        name   = str(row["CampaignName"])
+        source = row["Źródło"]
+
+        if source == "ADS":
+            return name  # ADS zostawiamy bez zmian
+
+        lookup = meta_lookup if source == "Meta" else tiktok_lookup
+
+        # Sprawdź czy GA4 name bezpośrednio pasuje
+        if name in lookup:
+            return name
+
+        # Stopniowe obcinanie sufixów
+        for variant in strip_suffix_variants(name):
+            if variant in lookup:
+                # Zwróć dopasowany wariant (bez oryginalnej końcówki GA4)
+                return variant
+
+        # Brak dopasowania — zostaw oryginalną nazwę z GA4
+        return name
+
+    ga4_agg["CampaignName"] = ga4_agg.apply(resolve_campaign_name, axis=1)
+
+    if selected_mpk_set:
+        ga4_agg = ga4_agg[ga4_agg["MPK"].isin(selected_mpk_set)]
+
+    return ga4_agg.sort_values(
+        ["Źródło","MPK","Revenue"], ascending=[True,True,False]
+    ).reset_index(drop=True)
+
+
+
+def build_meta_bq_table(fb_df: pd.DataFrame, selected_mpk_set: set) -> pd.DataFrame:
+    if fb_df is None or fb_df.empty:
+        return pd.DataFrame(columns=["MPK","CampaignId","CampaignName","Clicks","Spend"])
+
+    result = (
+        fb_df.groupby(["MPK","CampaignId","CampaignName"], as_index=False)
+        .agg(Clicks=("Clicks","sum"), Spend=("Spend","sum"))
+    )
+    result["CampaignId"]   = result["CampaignId"].astype(str)
+    # Dodaj F_ prefix
+    result["CampaignName"] = result["CampaignName"].apply(normalize_meta_campaign)
+
+    if selected_mpk_set:
+        result = result[result["MPK"].isin(selected_mpk_set)]
+
+    return result.sort_values(["MPK","Spend"], ascending=[True,False]).reset_index(drop=True)
+
+
+def build_tiktok_bq_table(tt_df: pd.DataFrame, selected_mpk_set: set) -> pd.DataFrame:
+    if tt_df is None or tt_df.empty:
+        return pd.DataFrame(columns=["MPK","campaign_id","campaign_name","spend"])
+
+    result = (
+        tt_df.groupby(["MPK","campaign_id","campaign_name"], as_index=False)
+        .agg(spend=("spend","sum"))
+    )
+    result["campaign_id"]   = result["campaign_id"].astype(str)
+    # Dodaj F_ prefix
+    result["campaign_name"] = result["campaign_name"].apply(normalize_meta_campaign)
+
+    if selected_mpk_set:
+        result = result[result["MPK"].isin(selected_mpk_set)]
+
+    return result.sort_values(["MPK","spend"], ascending=[True,False]).reset_index(drop=True)
+
 # ─────────────────────────────────────────────
 # CLIENTS
 # ─────────────────────────────────────────────
@@ -400,7 +558,7 @@ with st.spinner("⏳ Pobieranie danych…"):
         id_map_json     = id_map_json,
     )
 
-ga4_table    = build_ga4_table(combined_ga4, selected_mpk_set)
+ga4_table    = build_ga4_table(combined_ga4, fb_df, tt_df, selected_mpk_set)
 meta_table   = build_meta_bq_table(fb_df, selected_mpk_set)
 tiktok_table = build_tiktok_bq_table(tt_df, selected_mpk_set)
 
