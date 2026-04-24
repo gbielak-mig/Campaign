@@ -19,17 +19,33 @@ GA4_DIMENSIONS = ["sessionSource", "sessionMedium", "sessionCampaignName"]
 GA4_METRICS    = ["sessions", "transactions", "totalRevenue", "advertiserAdCost"]
 
 PLATFORM_FILTERS = {
-    "Web":  ["WEB"],
-    "App":  ["IOS", "ANDROID"],
+    "Web": ["WEB"],
+    "App": ["IOS", "ANDROID"],
 }
 
-st.markdown("""
-<style>
-.sec{font-size:15px;font-weight:500;color:var(--color-text-primary);
-     margin:20px 0 10px;padding-bottom:5px;
-     border-bottom:0.5px solid var(--color-border-tertiary)}
-</style>
-""", unsafe_allow_html=True)
+ADS_SOURCES    = {"google", "google ads", "googleads", "bing", "microsoft"}
+META_SOURCES   = {"facebook", "instagram", "fb", "meta"}
+TIKTOK_SOURCES = {"tiktok", "tik tok", "tiktok.com"}
+
+DATE_PRESETS = {
+    "Ostatnie 7 dni":  7,
+    "Ostatnie 14 dni": 14,
+    "Ostatnie 30 dni": 30,
+    "Ostatnie 60 dni": 60,
+    "Ostatnie 90 dni": 90,
+    "Własny zakres":   None,
+}
+
+META_ALIAS_TO_MPK = {
+    "50PL":"S501","BS":"S514","SPL":"S500","SDE":"G500",
+    "SCZ":"CZ50","SSK":"SK50","SLT":"LT50","SRO":"RO50",
+    "SYM":"S502","TBL":"S507","JDPL":"S512","JDRO":"RO55",
+    "JDSK":"SK52","JDHU":"HU52","JDLT":"LT52","JDBG":"BG52",
+    "JDCZ":"CZ55","JDUA":"UA52","JDHR":"HR52",
+}
+
+def extract_meta_alias(name: str) -> str:
+    return name.split("-")[0].strip().upper() if name else ""
 
 # ─────────────────────────────────────────────
 # MAPPINGS
@@ -52,17 +68,6 @@ tt_alias_to_mpk = {
     r["TT_Alias"]: r["MPK"]
     for _, r in property_mapping.iterrows() if r["TT_Alias"]
 }
-
-META_ALIAS_TO_MPK = {
-    "50PL":"S501","BS":"S514","SPL":"S500","SDE":"G500",
-    "SCZ":"CZ50","SSK":"SK50","SLT":"LT50","SRO":"RO50",
-    "SYM":"S502","TBL":"S507","JDPL":"S512","JDRO":"RO55",
-    "JDSK":"SK52","JDHU":"HU52","JDLT":"LT52","JDBG":"BG52",
-    "JDCZ":"CZ55","JDUA":"UA52","JDHR":"HR52",
-}
-
-def extract_meta_alias(name: str) -> str:
-    return name.split("-")[0].strip().upper() if name else ""
 
 # ─────────────────────────────────────────────
 # AUTH
@@ -107,33 +112,10 @@ except Exception as e:
     st.error(f"Błąd połączenia: {e}")
     st.stop()
 
-# ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
 yesterday = date.today() - timedelta(days=1)
 
-DATE_PRESETS = {
-    "Ostatnie 7 dni":  7,
-    "Ostatnie 14 dni": 14,
-    "Ostatnie 30 dni": 30,
-    "Ostatnie 60 dni": 60,
-    "Ostatnie 90 dni": 90,
-    "Własny zakres":   None,
-}
-
-ADS_SOURCES    = {"google", "google ads", "googleads", "bing", "microsoft"}
-META_SOURCES   = {"facebook", "instagram", "fb", "meta"}
-TIKTOK_SOURCES = {"tiktok", "tik tok", "tiktok.com"}
-
-def classify_source(src: str) -> str:
-    s = (src or "").lower().strip()
-    if s in ADS_SOURCES:    return "ADS"
-    if s in META_SOURCES:   return "Meta"
-    if s in TIKTOK_SOURCES: return "TikTok"
-    return "Other"
-
 # ─────────────────────────────────────────────
-# DATA FETCHING – GA4
+# HELPERS
 # ─────────────────────────────────────────────
 def build_platform_filter(vals):
     if not vals:
@@ -149,6 +131,9 @@ def build_platform_filter(vals):
         or_group=FilterExpressionList(expressions=exprs)
     )
 
+# ─────────────────────────────────────────────
+# DATA FETCHING – GA4
+# ─────────────────────────────────────────────
 def get_ga4_data(property_id, start_date, end_date, platform_expr=None):
     try:
         req = RunReportRequest(
@@ -175,10 +160,9 @@ def get_ga4_data(property_id, start_date, end_date, platform_expr=None):
         return pd.DataFrame(columns=GA4_DIMENSIONS + GA4_METRICS)
 
 # ─────────────────────────────────────────────
-# DATA FETCHING – Facebook / Meta
+# DATA FETCHING – Facebook / Meta (BQ)
 # ─────────────────────────────────────────────
 def get_facebook_data(start_date, end_date):
-    # POPRAWKA: CampaignId zamiast AdCampaignId
     q = f"""
         SELECT CampaignName, CampaignId, Clicks, Spend
         FROM `facebook-423312.meta.AdInsights`
@@ -195,11 +179,11 @@ def get_facebook_data(start_date, end_date):
     df["MPK"]           = df["_alias"].map(META_ALIAS_TO_MPK).fillna("")
     df["Spend"]         = pd.to_numeric(df["Spend"],  errors="coerce").fillna(0)
     df["Clicks"]        = pd.to_numeric(df["Clicks"], errors="coerce").fillna(0)
-    df["campaign_name"] = df["CampaignName"].astype(str)
+    df["CampaignName"]  = df["CampaignName"].astype(str)
     return df.drop(columns=["_alias"])
 
 # ─────────────────────────────────────────────
-# DATA FETCHING – TikTok
+# DATA FETCHING – TikTok (BQ)
 # ─────────────────────────────────────────────
 def get_tiktok_data(start_date, end_date):
     q = f"""
@@ -220,193 +204,91 @@ def get_tiktok_data(start_date, end_date):
         .fillna(df["advertiser_name"].astype(str).str.strip().map(META_ALIAS_TO_MPK))
         .fillna("")
     )
-    df["spend"]         = pd.to_numeric(df["spend"], errors="coerce").fillna(0)
+    df["spend"]        = pd.to_numeric(df["spend"], errors="coerce").fillna(0)
     df["campaign_name"] = df["campaign_name"].astype(str)
     return df
 
 # ─────────────────────────────────────────────
-# BUILD RESULT TABLE
+# BUILD TABLES (3 osobne)
 # ─────────────────────────────────────────────
-def _join_ga4_bq(
-    ga4_part:  pd.DataFrame,
-    bq_part:   pd.DataFrame,
-    brand_map: dict,
-    label:     str,
-) -> pd.DataFrame:
-    COLS = ["MPK","Brand","Źródło","CampaignId","CampaignName","Przychód","Spend"]
+def build_ga4_table(combined_ga4: pd.DataFrame, selected_mpk_set: set) -> pd.DataFrame:
+    """
+    Tabela 1: Przychody + koszty z GA4.
+    Kolumny: MPK, Brand, Źródło, CampaignName, Sessions, Transactions, Revenue, AdCost
+    """
+    if combined_ga4.empty:
+        return pd.DataFrame(columns=["MPK","Brand","Źródło","sessionMedium",
+                                      "CampaignName","Sessions","Transactions",
+                                      "Revenue","AdCost"])
 
-    def _ensure(df):
-        for c in COLS:
-            if c not in df.columns:
-                df[c] = "" if c in ("Brand","Źródło","CampaignId","CampaignName") else 0.0
-        return df
-
-    if ga4_part.empty and bq_part.empty:
-        return pd.DataFrame(columns=COLS)
-
-    if ga4_part.empty:
-        out = _ensure(bq_part.copy())
-        out["Przychód"] = 0.0
-        out["Źródło"]   = label
-        return out[COLS]
-
-    if bq_part.empty:
-        out = _ensure(ga4_part.copy())
-        out["Spend"]      = 0.0
-        out["CampaignId"] = ""
-        out["Źródło"]     = label
-        return out[COLS]
-
-    ga4 = ga4_part.copy()
-    bq  = bq_part.copy()
-    bq["CampaignId"] = bq["CampaignId"].astype(str).str.strip()
-
-    # Próba dopasowania po ID wyciągniętym z nazwy GA4 (10+ cyfr)
-    ga4["_id"] = ga4["CampaignName"].astype(str).str.extract(r"(\d{10,})", expand=False).fillna("")
-    matched_bq_ids = set()
-
-    frames = []
-
-    by_id = ga4[ga4["_id"] != ""].merge(
-        bq.rename(columns={"CampaignName": "_bq_name"}),
-        left_on=["MPK","_id"], right_on=["MPK","CampaignId"],
-        how="inner",
+    df = combined_ga4.copy()
+    df["Źródło"] = df["sessionSource"].str.lower().str.strip().apply(
+        lambda s: "ADS" if s in ADS_SOURCES
+        else ("Meta" if s in META_SOURCES
+              else ("TikTok" if s in TIKTOK_SOURCES else "Other"))
     )
-    if not by_id.empty:
-        by_id["CampaignName"] = by_id["_bq_name"].fillna(by_id["CampaignName"])
-        matched_bq_ids = set(by_id["CampaignId"].dropna().astype(str))
-        row = by_id[["MPK","Brand","CampaignId","CampaignName","Przychód","Spend"]].copy()
-        row["Brand"] = row["Brand"].fillna(row["MPK"].map(brand_map)).fillna("")
-        frames.append(row)
 
-    # Reszta — outer merge po nazwie
-    ga4_rest = ga4[~ga4["_id"].isin(matched_bq_ids)].copy()
-    bq_rest  = bq[~bq["CampaignId"].isin(matched_bq_ids)].copy()
-
-    by_name = ga4_rest[["MPK","Brand","CampaignName","Przychód"]].merge(
-        bq_rest[["MPK","CampaignId","CampaignName","Brand","Spend"]],
-        on=["MPK","CampaignName"],
-        how="outer",
-        suffixes=("_ga4","_bq"),
+    result = (
+        df.groupby(["MPK","Brand","Źródło","sessionMedium","sessionCampaignName"], as_index=False)
+        .agg(
+            Sessions     =("sessions",         "sum"),
+            Transactions =("transactions",      "sum"),
+            Revenue      =("totalRevenue",      "sum"),
+            AdCost       =("advertiserAdCost",  "sum"),
+        )
+        .rename(columns={"sessionCampaignName": "CampaignName"})
     )
-    # Scalamy Brand z obu stron
-    by_name["Brand"] = by_name.get("Brand_ga4", pd.Series(dtype=str)).fillna(
-        by_name.get("Brand_bq", pd.Series(dtype=str))
-    ).fillna(by_name["MPK"].map(brand_map)).fillna("")
-    by_name["CampaignId"] = by_name.get("CampaignId", pd.Series(dtype=str)).fillna("")
-    by_name["Przychód"]   = by_name.get("Przychód",   pd.Series(dtype=float)).fillna(0.0)
-    by_name["Spend"]      = by_name.get("Spend",      pd.Series(dtype=float)).fillna(0.0)
-    if not by_name.empty:
-        frames.append(by_name[["MPK","Brand","CampaignId","CampaignName","Przychód","Spend"]])
-
-    if not frames:
-        return pd.DataFrame(columns=COLS)
-
-    merged = pd.concat(frames, ignore_index=True)
-    for c in ["Przychód","Spend"]:
-        merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0.0)
-    merged["CampaignId"] = merged["CampaignId"].fillna("").astype(str)
-    merged["Źródło"]     = label
-    return merged[COLS]
-
-
-def build_table(
-    ga4_df:          pd.DataFrame,
-    fb_df:           pd.DataFrame,
-    tt_df:           pd.DataFrame,
-    prop_map:        pd.DataFrame,
-    selected_mpk_set: set,
-    source_filter:   str,
-) -> pd.DataFrame:
-    brand_map = prop_map.set_index("MPK")["Brand"].to_dict()
-    rows = []
-
-    # ── ADS: tylko GA4, Spend = advertiserAdCost ──
-    if source_filter in ("ADS", "Wszystkie") and ga4_df is not None and not ga4_df.empty:
-        ads_slice = ga4_df[ga4_df["sessionSource"].str.lower().str.strip().isin(ADS_SOURCES)].copy()
-        if not ads_slice.empty:
-            agg = (
-                ads_slice
-                .groupby(["MPK","Brand","sessionCampaignName"], as_index=False)
-                .agg(Przychód=("totalRevenue","sum"), Spend=("advertiserAdCost","sum"))
-                .rename(columns={"sessionCampaignName":"CampaignName"})
-            )
-            agg["Źródło"]     = "ADS"
-            agg["CampaignId"] = ""
-            rows.append(agg[["MPK","Brand","Źródło","CampaignId","CampaignName","Przychód","Spend"]])
-
-    # ── Meta: BQ spend + GA4 revenue ──────────────
-    if source_filter in ("Meta", "Wszystkie"):
-        meta_ga4 = pd.DataFrame()
-        if ga4_df is not None and not ga4_df.empty:
-            sl = ga4_df[ga4_df["sessionSource"].str.lower().str.strip().isin(META_SOURCES)].copy()
-            if not sl.empty:
-                meta_ga4 = (
-                    sl.groupby(["MPK","Brand","sessionCampaignName"], as_index=False)
-                    .agg(Przychód=("totalRevenue","sum"))
-                    .rename(columns={"sessionCampaignName":"CampaignName"})
-                )
-
-        meta_bq = pd.DataFrame()
-        if fb_df is not None and not fb_df.empty:
-            meta_bq = (
-                fb_df.groupby(["MPK","CampaignId","campaign_name"], as_index=False)
-                .agg(Spend=("Spend","sum"))
-                .rename(columns={"campaign_name":"CampaignName"})
-            )
-            meta_bq["CampaignId"] = meta_bq["CampaignId"].astype(str)
-            meta_bq["Brand"]      = meta_bq["MPK"].map(brand_map).fillna("")
-
-        joined = _join_ga4_bq(meta_ga4, meta_bq, brand_map, "Meta")
-        if not joined.empty:
-            rows.append(joined)
-
-    # ── TikTok: BQ spend + GA4 revenue ────────────
-    if source_filter in ("TikTok", "Wszystkie"):
-        tt_ga4 = pd.DataFrame()
-        if ga4_df is not None and not ga4_df.empty:
-            sl = ga4_df[ga4_df["sessionSource"].str.lower().str.strip().isin(TIKTOK_SOURCES)].copy()
-            if not sl.empty:
-                tt_ga4 = (
-                    sl.groupby(["MPK","Brand","sessionCampaignName"], as_index=False)
-                    .agg(Przychód=("totalRevenue","sum"))
-                    .rename(columns={"sessionCampaignName":"CampaignName"})
-                )
-
-        tt_bq = pd.DataFrame()
-        if tt_df is not None and not tt_df.empty:
-            tt_bq = (
-                tt_df.groupby(["MPK","campaign_id","campaign_name"], as_index=False)
-                .agg(Spend=("spend","sum"))
-                .rename(columns={"campaign_id":"CampaignId","campaign_name":"CampaignName"})
-            )
-            tt_bq["CampaignId"] = tt_bq["CampaignId"].astype(str)
-            tt_bq["Brand"]      = tt_bq["MPK"].map(brand_map).fillna("")
-
-        joined = _join_ga4_bq(tt_ga4, tt_bq, brand_map, "TikTok")
-        if not joined.empty:
-            rows.append(joined)
-
-    if not rows:
-        return pd.DataFrame(columns=["MPK","Brand","Źródło","CampaignId","CampaignName","Przychód","Spend"])
-
-    result = pd.concat(rows, ignore_index=True)
 
     if selected_mpk_set:
         result = result[result["MPK"].isin(selected_mpk_set)]
 
-    for c in ["Przychód","Spend"]:
-        result[c] = pd.to_numeric(result[c], errors="coerce").fillna(0.0)
+    return result.sort_values(["Źródło","MPK","Revenue"], ascending=[True,True,False]).reset_index(drop=True)
 
-    return result.sort_values(["Źródło","MPK","Przychód"], ascending=[True,True,False]).reset_index(drop=True)
 
+def build_meta_bq_table(fb_df: pd.DataFrame, selected_mpk_set: set) -> pd.DataFrame:
+    """
+    Tabela 2: Meta Spend z BigQuery.
+    Kolumny: MPK, CampaignId, CampaignName, Clicks, Spend
+    """
+    if fb_df is None or fb_df.empty:
+        return pd.DataFrame(columns=["MPK","CampaignId","CampaignName","Clicks","Spend"])
+
+    result = (
+        fb_df.groupby(["MPK","CampaignId","CampaignName"], as_index=False)
+        .agg(Clicks=("Clicks","sum"), Spend=("Spend","sum"))
+    )
+    result["CampaignId"] = result["CampaignId"].astype(str)
+
+    if selected_mpk_set:
+        result = result[result["MPK"].isin(selected_mpk_set)]
+
+    return result.sort_values(["MPK","Spend"], ascending=[True,False]).reset_index(drop=True)
+
+
+def build_tiktok_bq_table(tt_df: pd.DataFrame, selected_mpk_set: set) -> pd.DataFrame:
+    """
+    Tabela 3: TikTok Spend z BigQuery.
+    Kolumny: MPK, campaign_id, campaign_name, spend
+    """
+    if tt_df is None or tt_df.empty:
+        return pd.DataFrame(columns=["MPK","campaign_id","campaign_name","spend"])
+
+    result = (
+        tt_df.groupby(["MPK","campaign_id","campaign_name"], as_index=False)
+        .agg(spend=("spend","sum"))
+    )
+    result["campaign_id"] = result["campaign_id"].astype(str)
+
+    if selected_mpk_set:
+        result = result[result["MPK"].isin(selected_mpk_set)]
+
+    return result.sort_values(["MPK","spend"], ascending=[True,False]).reset_index(drop=True)
 
 # ─────────────────────────────────────────────
-# FETCH ALL DATA (cached by params)
+# FETCH ALL (cached)
 # ─────────────────────────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_all(mpk_tuple, start_date, end_date, platform_choice, id_map_json):
-    """Pobiera dane GA4 + BQ dla podanych parametrów."""
     from io import StringIO
     id_map = pd.read_json(StringIO(id_map_json))
 
@@ -435,7 +317,6 @@ def fetch_all(mpk_tuple, start_date, end_date, platform_choice, id_map_json):
 
     return combined_ga4, fb_df, tt_df
 
-
 # ─────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────
@@ -443,19 +324,10 @@ with st.sidebar:
     st.title("📊 Dashboard")
     st.markdown("---")
 
-    # Źródło
-    st.subheader("📡 Źródło")
-    source_filter = st.radio("Źródło:", ["Wszystkie", "ADS", "Meta", "TikTok"], index=0)
-
-    st.markdown("---")
-
-    # Platforma
     st.subheader("📱 Platforma GA4")
     platform_choice = st.radio("Platforma:", ["Web", "App", "Web + App"], index=2)
-
     st.markdown("---")
 
-    # Sklep
     st.subheader("🏬 Sklep")
     brand_options   = sorted(property_mapping["Brand"].unique())
     selected_brands = st.multiselect("Brand:", options=brand_options, default=[])
@@ -468,10 +340,8 @@ with st.sidebar:
 
     st.caption(f"Wybrano {len(filtered_map)} sklep(ów)")
     selected_mpk_set = set(filtered_map["MPK"].tolist())
-
     st.markdown("---")
 
-    # Zakres dat
     st.subheader("📅 Zakres dat")
     preset_label = st.selectbox("Preset:", list(DATE_PRESETS.keys()), index=0)
     preset_days  = DATE_PRESETS[preset_label]
@@ -491,31 +361,24 @@ with st.sidebar:
 # ─────────────────────────────────────────────
 st.title("📊 GA4 + Social Dashboard")
 h1, h2, h3 = st.columns(3)
-h1.metric("Sklepów",  len(filtered_map))
+h1.metric("Sklepów",   len(filtered_map))
 h2.metric("Platforma", platform_choice)
-h3.metric("Zakres",   f"{start_date} → {end_date}")
+h3.metric("Zakres",    f"{start_date} → {end_date}")
 
 # ─────────────────────────────────────────────
-# AUTO-REFRESH z 5s opóźnieniem
+# AUTO-REFRESH (2s debounce)
 # ─────────────────────────────────────────────
-# Klucz do wykrywania zmiany parametrów
 params_key = (
     tuple(sorted(selected_mpk_set)),
     str(start_date),
     str(end_date),
     platform_choice,
-    source_filter,
 )
-
 if st.session_state.get("last_params") != params_key:
-    st.session_state["last_params"]    = params_key
-    st.session_state["pending_params"] = params_key
-    st.session_state["pending_at"]     = time.time()
+    st.session_state["last_params"] = params_key
+    st.session_state["pending_at"]  = time.time()
 
-# Czekaj 5 sekund po ostatniej zmianie
-pending_at = st.session_state.get("pending_at", 0)
-secs_left  = 2 - (time.time() - pending_at)
-
+secs_left = 2 - (time.time() - st.session_state.get("pending_at", 0))
 if secs_left > 0:
     time.sleep(1)
     st.rerun()
@@ -530,45 +393,64 @@ if filtered_map.empty:
 with st.spinner("⏳ Pobieranie danych…"):
     id_map_json = filtered_map[["MPK","Brand","ID_GA4"]].to_json()
     combined_ga4, fb_df, tt_df = fetch_all(
-        mpk_tuple      = tuple(sorted(selected_mpk_set)),
-        start_date     = start_date,
-        end_date       = end_date,
-        platform_choice= platform_choice,
-        id_map_json    = id_map_json,
+        mpk_tuple       = tuple(sorted(selected_mpk_set)),
+        start_date      = start_date,
+        end_date        = end_date,
+        platform_choice = platform_choice,
+        id_map_json     = id_map_json,
     )
 
-result = build_table(
-    ga4_df         = combined_ga4,
-    fb_df          = fb_df,
-    tt_df          = tt_df,
-    prop_map       = property_mapping,
-    selected_mpk_set = selected_mpk_set,
-    source_filter  = source_filter,
-)
+ga4_table    = build_ga4_table(combined_ga4, selected_mpk_set)
+meta_table   = build_meta_bq_table(fb_df, selected_mpk_set)
+tiktok_table = build_tiktok_bq_table(tt_df, selected_mpk_set)
 
 # ─────────────────────────────────────────────
-# RENDER
+# RENDER – 3 TABELE
 # ─────────────────────────────────────────────
-if result.empty:
-    st.warning("Brak danych do wyświetlenia.")
-    st.stop()
-
-st.success(f"✅ Pobrano {len(result):,} wierszy")
-
-NUM_CFG = {
-    "Przychód": st.column_config.NumberColumn(format="%.2f"),
-    "Spend":    st.column_config.NumberColumn(format="%.2f"),
+NUM_CFG_GA4 = {
+    "Revenue": st.column_config.NumberColumn(format="%.2f"),
+    "AdCost":  st.column_config.NumberColumn(format="%.2f"),
+}
+NUM_CFG_BQ = {
+    "Spend": st.column_config.NumberColumn(format="%.2f"),
+    "spend": st.column_config.NumberColumn(format="%.2f"),
 }
 
-st.dataframe(
-    result,
-    use_container_width=True,
-    height=600,
-    column_config=NUM_CFG,
-)
+# ── Tabela 1: GA4 ─────────────────────────────
+st.subheader("📊 GA4 — przychody i koszty kampanii")
+if ga4_table.empty:
+    st.info("Brak danych GA4.")
+else:
+    st.dataframe(ga4_table, use_container_width=True, height=400, column_config=NUM_CFG_GA4)
+    st.caption(
+        f"Wierszy: {len(ga4_table):,}  |  "
+        f"Revenue: {ga4_table['Revenue'].sum():,.2f}  |  "
+        f"AdCost: {ga4_table['AdCost'].sum():,.2f}"
+    )
 
-st.caption(
-    f"Wierszy: {len(result):,}  |  "
-    f"Przychód: {result['Przychód'].sum():,.2f}  |  "
-    f"Spend: {result['Spend'].sum():,.2f}"
-)
+st.divider()
+
+# ── Tabela 2: Meta BQ ─────────────────────────
+st.subheader("📘 Meta — spend z BigQuery")
+if meta_table.empty:
+    st.info("Brak danych Meta.")
+else:
+    st.dataframe(meta_table, use_container_width=True, height=400, column_config=NUM_CFG_BQ)
+    st.caption(
+        f"Wierszy: {len(meta_table):,}  |  "
+        f"Spend: {meta_table['Spend'].sum():,.2f}  |  "
+        f"Clicks: {meta_table['Clicks'].sum():,.0f}"
+    )
+
+st.divider()
+
+# ── Tabela 3: TikTok BQ ───────────────────────
+st.subheader("🎵 TikTok — spend z BigQuery")
+if tiktok_table.empty:
+    st.info("Brak danych TikTok.")
+else:
+    st.dataframe(tiktok_table, use_container_width=True, height=400, column_config=NUM_CFG_BQ)
+    st.caption(
+        f"Wierszy: {len(tiktok_table):,}  |  "
+        f"Spend: {tiktok_table['spend'].sum():,.2f}"
+    )
