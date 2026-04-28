@@ -83,8 +83,9 @@ if not st.session_state.get("authenticated"):
             st.error("❌ Błędne hasło!")
     st.stop()
 
-
-
+# ─────────────────────────────────────────────
+# CAMPAIGN NAME HELPERS
+# ─────────────────────────────────────────────
 def normalize_meta_campaign(name: str) -> str:
     """Dodaje F_ prefix do nazwy kampanii z Meta/TikTok."""
     name = str(name).strip()
@@ -92,7 +93,7 @@ def normalize_meta_campaign(name: str) -> str:
         name = "F_" + name
     return name
 
-def strip_suffix_variants(name: str) -> list[str]:
+def strip_suffix_variants(name: str) -> list:
     """
     Zwraca listę wariantów nazwy przez stopniowe obcinanie
     ostatnich segmentów po myślniku.
@@ -104,7 +105,7 @@ def strip_suffix_variants(name: str) -> list[str]:
         variants.append("-".join(parts[:i]))
     return variants
 
-def match_ga4_to_bq(ga4_name: str, bq_lookup: dict) -> str | None:
+def match_ga4_to_bq(ga4_name: str, bq_lookup: dict):
     """
     Próbuje dopasować nazwę kampanii z GA4 do BQ (Meta/TikTok)
     przez stopniowe obcinanie sufixów.
@@ -116,8 +117,9 @@ def match_ga4_to_bq(ga4_name: str, bq_lookup: dict) -> str | None:
             return bq_lookup[variant]
     return None
 
-
-
+# ─────────────────────────────────────────────
+# BUILD TABLES
+# ─────────────────────────────────────────────
 def build_ga4_table(
     combined_ga4: pd.DataFrame,
     fb_df:        pd.DataFrame,
@@ -163,7 +165,7 @@ def build_ga4_table(
     if fb_df is not None and not fb_df.empty:
         for name in fb_df["CampaignName"].dropna().unique():
             normalized = normalize_meta_campaign(name)
-            meta_lookup[normalized] = name  # zachowaj oryginał BQ
+            meta_lookup[normalized] = name
 
     # TikTok lookup: "F_" + oryginalna nazwa
     tiktok_lookup = {}
@@ -189,7 +191,6 @@ def build_ga4_table(
         # Stopniowe obcinanie sufixów
         for variant in strip_suffix_variants(name):
             if variant in lookup:
-                # Zwróć dopasowany wariant (bez oryginalnej końcówki GA4)
                 return variant
 
         # Brak dopasowania — zostaw oryginalną nazwę z GA4
@@ -205,8 +206,11 @@ def build_ga4_table(
     ).reset_index(drop=True)
 
 
-
 def build_meta_bq_table(fb_df: pd.DataFrame, selected_mpk_set: set) -> pd.DataFrame:
+    """
+    Tabela 2: Meta Spend z BigQuery.
+    Kolumny: MPK, CampaignId, CampaignName, Clicks, Spend
+    """
     if fb_df is None or fb_df.empty:
         return pd.DataFrame(columns=["MPK","CampaignId","CampaignName","Clicks","Spend"])
 
@@ -225,6 +229,10 @@ def build_meta_bq_table(fb_df: pd.DataFrame, selected_mpk_set: set) -> pd.DataFr
 
 
 def build_tiktok_bq_table(tt_df: pd.DataFrame, selected_mpk_set: set) -> pd.DataFrame:
+    """
+    Tabela 3: TikTok Spend z BigQuery.
+    Kolumny: MPK, campaign_id, campaign_name, spend
+    """
     if tt_df is None or tt_df.empty:
         return pd.DataFrame(columns=["MPK","campaign_id","campaign_name","spend"])
 
@@ -362,85 +370,9 @@ def get_tiktok_data(start_date, end_date):
         .fillna(df["advertiser_name"].astype(str).str.strip().map(META_ALIAS_TO_MPK))
         .fillna("")
     )
-    df["spend"]        = pd.to_numeric(df["spend"], errors="coerce").fillna(0)
+    df["spend"]         = pd.to_numeric(df["spend"], errors="coerce").fillna(0)
     df["campaign_name"] = df["campaign_name"].astype(str)
     return df
-
-# ─────────────────────────────────────────────
-# BUILD TABLES (3 osobne)
-# ─────────────────────────────────────────────
-def build_ga4_table(combined_ga4: pd.DataFrame, selected_mpk_set: set) -> pd.DataFrame:
-    """
-    Tabela 1: Przychody + koszty z GA4.
-    Kolumny: MPK, Brand, Źródło, CampaignName, Sessions, Transactions, Revenue, AdCost
-    """
-    if combined_ga4.empty:
-        return pd.DataFrame(columns=["MPK","Brand","Źródło","sessionMedium",
-                                      "CampaignName","Sessions","Transactions",
-                                      "Revenue","AdCost"])
-
-    df = combined_ga4.copy()
-    df["Źródło"] = df["sessionSource"].str.lower().str.strip().apply(
-        lambda s: "ADS" if s in ADS_SOURCES
-        else ("Meta" if s in META_SOURCES
-              else ("TikTok" if s in TIKTOK_SOURCES else "Other"))
-    )
-
-    result = (
-        df.groupby(["MPK","Brand","Źródło","sessionMedium","sessionCampaignName"], as_index=False)
-        .agg(
-            Sessions     =("sessions",         "sum"),
-            Transactions =("transactions",      "sum"),
-            Revenue      =("totalRevenue",      "sum"),
-            AdCost       =("advertiserAdCost",  "sum"),
-        )
-        .rename(columns={"sessionCampaignName": "CampaignName"})
-    )
-
-    if selected_mpk_set:
-        result = result[result["MPK"].isin(selected_mpk_set)]
-
-    return result.sort_values(["Źródło","MPK","Revenue"], ascending=[True,True,False]).reset_index(drop=True)
-
-
-def build_meta_bq_table(fb_df: pd.DataFrame, selected_mpk_set: set) -> pd.DataFrame:
-    """
-    Tabela 2: Meta Spend z BigQuery.
-    Kolumny: MPK, CampaignId, CampaignName, Clicks, Spend
-    """
-    if fb_df is None or fb_df.empty:
-        return pd.DataFrame(columns=["MPK","CampaignId","CampaignName","Clicks","Spend"])
-
-    result = (
-        fb_df.groupby(["MPK","CampaignId","CampaignName"], as_index=False)
-        .agg(Clicks=("Clicks","sum"), Spend=("Spend","sum"))
-    )
-    result["CampaignId"] = result["CampaignId"].astype(str)
-
-    if selected_mpk_set:
-        result = result[result["MPK"].isin(selected_mpk_set)]
-
-    return result.sort_values(["MPK","Spend"], ascending=[True,False]).reset_index(drop=True)
-
-
-def build_tiktok_bq_table(tt_df: pd.DataFrame, selected_mpk_set: set) -> pd.DataFrame:
-    """
-    Tabela 3: TikTok Spend z BigQuery.
-    Kolumny: MPK, campaign_id, campaign_name, spend
-    """
-    if tt_df is None or tt_df.empty:
-        return pd.DataFrame(columns=["MPK","campaign_id","campaign_name","spend"])
-
-    result = (
-        tt_df.groupby(["MPK","campaign_id","campaign_name"], as_index=False)
-        .agg(spend=("spend","sum"))
-    )
-    result["campaign_id"] = result["campaign_id"].astype(str)
-
-    if selected_mpk_set:
-        result = result[result["MPK"].isin(selected_mpk_set)]
-
-    return result.sort_values(["MPK","spend"], ascending=[True,False]).reset_index(drop=True)
 
 # ─────────────────────────────────────────────
 # FETCH ALL (cached)
