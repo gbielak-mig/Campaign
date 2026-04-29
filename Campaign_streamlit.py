@@ -89,11 +89,15 @@ if not st.session_state.get("authenticated"):
 # CAMPAIGN NAME HELPERS
 # ─────────────────────────────────────────────
 def normalize_meta_campaign(name: str) -> str:
-    """Dodaje F_ prefix do nazwy kampanii z Meta/TikTok."""
+    """Dodaje F_ prefix do nazwy kampanii z Meta."""
     name = str(name).strip()
     if not name.startswith("F_"):
         name = "F_" + name
     return name
+
+def normalize_tiktok_campaign(name: str) -> str:
+    """Normalizuje nazwę kampanii TikTok — bez dodawania F_."""
+    return str(name).strip()
 
 def strip_suffix_variants(name: str) -> list:
     """
@@ -144,16 +148,18 @@ def build_merged_table(
         return pd.DataFrame()
 
     # ── Buduj lookup BQ: normalized_name → oryginalna BQ name ─────────
+    # Meta: z F_ prefixem
     meta_lookup = {}
     if fb_df is not None and not fb_df.empty:
         for name in fb_df["CampaignName"].dropna().unique():
             normalized = normalize_meta_campaign(name)
-            meta_lookup[normalized] = normalized  # klucz i wartość to znormalizowana nazwa
+            meta_lookup[normalized] = normalized
 
+    # TikTok: bez F_ prefixu
     tiktok_lookup = {}
     if tt_df is not None and not tt_df.empty:
         for name in tt_df["campaign_name"].dropna().unique():
-            normalized = normalize_meta_campaign(name)
+            normalized = normalize_tiktok_campaign(name)
             tiktok_lookup[normalized] = normalized
 
     # ── Dopasuj CampaignName z GA4 do BQ ────────────────────────────
@@ -192,7 +198,7 @@ def build_merged_table(
         .rename(columns={"CampaignName_resolved": "CampaignName"})
     )
 
-    # ── Przygotuj Meta BQ — normalizuj nazwy i agreguj po MPK + CampaignName ─
+    # ── Przygotuj Meta BQ — normalizuj nazwy (z F_) i agreguj po MPK + CampaignName ─
     meta_bq = pd.DataFrame()
     if fb_df is not None and not fb_df.empty and "Meta" in (selected_sources or SOURCE_LABELS):
         meta_tmp = fb_df.copy()
@@ -202,11 +208,11 @@ def build_merged_table(
             .agg(BQ_Spend=("Spend", "sum"), Clicks=("Clicks", "sum"))
         )
 
-    # ── Przygotuj TikTok BQ — normalizuj nazwy i agreguj po MPK + CampaignName ─
+    # ── Przygotuj TikTok BQ — normalizuj nazwy (bez F_) i agreguj po MPK + CampaignName ─
     tiktok_bq = pd.DataFrame()
     if tt_df is not None and not tt_df.empty and "TikTok" in (selected_sources or SOURCE_LABELS):
         tt_tmp = tt_df.copy()
-        tt_tmp["CampaignName"] = tt_tmp["campaign_name"].apply(normalize_meta_campaign)
+        tt_tmp["CampaignName"] = tt_tmp["campaign_name"].apply(normalize_tiktok_campaign)
         tiktok_bq = (
             tt_tmp.groupby(["MPK", "CampaignName"], as_index=False)
             .agg(BQ_Spend=("spend", "sum"))
@@ -274,7 +280,7 @@ def build_tiktok_bq_table(tt_df: pd.DataFrame, selected_mpk_set: set) -> pd.Data
     if tt_df is None or tt_df.empty:
         return pd.DataFrame(columns=["MPK","campaign_id","CampaignName","Spend"])
     tmp = tt_df.copy()
-    tmp["CampaignName"] = tmp["campaign_name"].apply(normalize_meta_campaign)
+    tmp["CampaignName"] = tmp["campaign_name"].apply(normalize_tiktok_campaign)
     result = (
         tmp.groupby(["MPK","campaign_id","CampaignName"], as_index=False)
         .agg(Spend=("spend","sum"))
